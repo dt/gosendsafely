@@ -278,12 +278,16 @@ func OpenPackage(rawURL string, lim Sem, credOpts CredentialOptions) (*Package, 
 		return nil, err
 	}
 
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 16
+
 	cl := &client{
 		baseURL:   baseURL,
 		apiKey:    creds.APIKey,
 		apiSecret: creds.APISecret,
 		http: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: transport,
 		},
 	}
 	pkg, err := cl.getPackage(packageCode, keyCode)

@@ -40,7 +40,7 @@ ssunzip -l "https://sendsafely.example.com/receive/?packageCode=ABC123#keyCode=x
 - Parallel chunk downloading and file extraction
 - Glob pattern filtering for selective extraction
 - Automatic common prefix stripping (e.g., removes top-level folder if all files share one)
-- Skips files that already exist with matching size
+- Skips downloading files that already exist with matching size
 - Handles (slightly) truncated archives, decoding available index entries
   - *Caveat:* Only recovers files whose central directory entries are intact (i.e. where truncation of the archive was minimal or limited to few KB). For comprehensive recovery, download the full archive via `ssget` and use a local ZIP recovery tool.
 
@@ -72,7 +72,9 @@ ssget -l "https://sendsafely.example.com/receive/?packageCode=ABC123#keyCode=xyz
 
 **Features:**
 - Parallel chunk downloading (up to 16 concurrent)
-- Automatic resumption of interrupted downloads (skips existing, completed files)
+- Automatic resumption of interrupted downloads 
+  - resumes partially downloaded files
+  - skips existing, completed files
 
 ## Installation
 
