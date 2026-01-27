@@ -15,9 +15,6 @@ import (
 	"testing"
 
 	"crypto/pbkdf2"
-
-	"github.com/ProtonMail/go-crypto/openpgp"
-	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
 // mockSendSafelyServer creates a test server that simulates the SendSafely API.
@@ -218,7 +215,7 @@ func (m *mockSendSafelyServer) handleDownload(w http.ResponseWriter, r *http.Req
 
 	// Encrypt the chunk data with PGP
 	passphrase := pkg.serverSecret + pkg.keyCode
-	encrypted, err := encryptPGP(file.chunks[chunkIndex], passphrase)
+	encrypted, err := EncryptPGP(file.chunks[chunkIndex], passphrase)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -234,27 +231,6 @@ func (m *mockSendSafelyServer) validateAuth(r *http.Request) bool {
 
 func (m *mockSendSafelyServer) addPackage(pkg *mockPackage) {
 	m.packages[pkg.packageCode] = pkg
-}
-
-// encryptPGP encrypts data using PGP symmetric encryption with the given passphrase.
-func encryptPGP(data []byte, passphrase string) ([]byte, error) {
-	var buf bytes.Buffer
-	config := &packet.Config{
-		DefaultCipher: packet.CipherAES256,
-	}
-
-	pt, err := openpgp.SymmetricallyEncrypt(&buf, []byte(passphrase), nil, config)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := pt.Write(data); err != nil {
-		return nil, err
-	}
-	if err := pt.Close(); err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
 }
 
 // TestOpenPackage_Success tests successfully opening a package and listing files.

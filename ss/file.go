@@ -16,32 +16,6 @@ type span struct {
 	length int
 }
 
-// Sem is a counting semaphore for limiting concurrent operations.
-type Sem chan struct{}
-
-// Limiter creates a semaphore that limits concurrency to n operations.
-func Limiter(n int) Sem {
-	return make(Sem, n)
-}
-
-func (l Sem) Acquire(ctx context.Context) {
-	if l != nil {
-		select {
-		case l <- struct{}{}:
-		case <-ctx.Done():
-		}
-	}
-}
-
-func (l Sem) Release() {
-	if l != nil {
-		select {
-		case <-l:
-		default:
-		}
-	}
-}
-
 // Chunk represents a segment of a chunked file that can be fetched on demand.
 type Chunk[T any] struct {
 	ID  T

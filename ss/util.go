@@ -1,10 +1,37 @@
 package ss
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"time"
 )
+
+// Sem is a counting semaphore for limiting concurrent operations.
+type Sem chan struct{}
+
+// Limiter creates a semaphore that limits concurrency to n operations.
+func Limiter(n int) Sem {
+	return make(Sem, n)
+}
+
+func (l Sem) Acquire(ctx context.Context) {
+	if l != nil {
+		select {
+		case l <- struct{}{}:
+		case <-ctx.Done():
+		}
+	}
+}
+
+func (l Sem) Release() {
+	if l != nil {
+		select {
+		case <-l:
+		default:
+		}
+	}
+}
 
 // BytesSize is a byte count that formats with human-readable units (KB, MB, etc).
 type BytesSize int
