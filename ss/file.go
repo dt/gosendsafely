@@ -193,7 +193,7 @@ func (r *chunkReader[T]) Read(p []byte) (int, error) {
 	// Wait for the current chunk to be ready.
 	select {
 	case <-r.src[r.cur].ready:
-	case <-time.After(5 * time.Second):
+	case <-time.After(5 * time.Minute):
 		return 0, fmt.Errorf("timeout waiting for chunk %d", r.src[r.cur].Idx)
 	}
 
