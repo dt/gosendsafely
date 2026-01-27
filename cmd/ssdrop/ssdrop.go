@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/dt/gosendsafely/sendsafely"
@@ -19,18 +20,21 @@ var (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "ssput [flags] FILE [FILE...]",
+		Use:   "ssdrop [flags] FILE [FILE...]",
 		Short: "Upload files to a SendSafely dropzone",
 		Long: `Upload files to a SendSafely dropzone.
+
+This tool uploads files to SendSafely dropzones (anonymous upload portals).
+It does not require API credentials - only the dropzone URL and ID.
 
 Files are encrypted client-side and uploaded in chunks. After upload,
 a secure link is returned that can be shared with recipients.
 
 Example:
-  ssput --url="https://dropzone.example.com" \
-        --dropzone-id="your_dropzone_id" \
-        --email="sender@example.com" \
-        file1.txt file2.zip`,
+  ssdrop --url="https://dropzone.example.com" \
+         --dropzone-id="your_dropzone_id" \
+         --email="sender@example.com" \
+         file1.txt file2.zip`,
 		Args:         cobra.MinimumNArgs(1),
 		RunE:         run,
 		SilenceUsage: true,
@@ -61,6 +65,15 @@ func run(cmd *cobra.Command, files []string) error {
 		totalSize += info.Size()
 	}
 
+	// Print what we're uploading
+	if len(files) == 1 {
+		fmt.Fprintf(os.Stderr, "Uploading %s (%s) to %s...\n",
+			filepath.Base(files[0]), util.BytesSize(totalSize), dropzoneURL)
+	} else {
+		fmt.Fprintf(os.Stderr, "Uploading %d files (%s) to %s...\n",
+			len(files), util.BytesSize(totalSize), dropzoneURL)
+	}
+
 	before := time.Now()
 	link, err := sendsafely.UploadToDropzone(
 		dropzoneURL,
@@ -68,7 +81,7 @@ func run(cmd *cobra.Command, files []string) error {
 		email,
 		name,
 		func(name string, size util.BytesSize, mbps util.BytesSize, frac float64) {
-				fmt.Fprintf(os.Stderr, "\r%s (%s): %.1f%% (%s/s)", name, size, frac*100, mbps)
+			fmt.Fprintf(os.Stderr, "\r%-60s", fmt.Sprintf("%s (%s): %.1f%% (%s/s)", name, size, frac*100, mbps))
 		},
 		files...,
 	)
@@ -77,7 +90,7 @@ func run(cmd *cobra.Command, files []string) error {
 	}
 	dur := time.Since(before)
 
-	fmt.Fprintf(os.Stderr, "%80s\n", ""	) // blank out last progress line.
+	fmt.Fprintf(os.Stderr, "\r%80s\r", "") // blank out last progress line
 
 	fmt.Fprintf(os.Stderr, "Uploaded %d files (%s)\t %s (%s/s)\n",
 		len(files),util.BytesSize(totalSize), util.ConciseDuration(dur), util.BytesSize(float64(totalSize) / dur.Seconds()))

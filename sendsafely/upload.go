@@ -3,7 +3,9 @@ package sendsafely
 import (
 	"bytes"
 	"context"
+	"crypto/pbkdf2"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -132,6 +134,7 @@ func (c *dropzoneClient) createPackage() (*uploadPackage, error) {
 	var pkgResp struct {
 		Response     string `json:"response"`
 		Message      string `json:"message"`
+		ErrorID      string `json:"errorId"`
 		PackageID    string `json:"packageId"`
 		PackageCode  string `json:"packageCode"`
 		ServerSecret string `json:"serverSecret"`
@@ -141,6 +144,9 @@ func (c *dropzoneClient) createPackage() (*uploadPackage, error) {
 	}
 
 	if pkgResp.Response != "SUCCESS" {
+		if pkgResp.ErrorID != "" {
+			return nil, fmt.Errorf("create package failed: %s - %s (errorId: %s)", pkgResp.Response, pkgResp.Message, pkgResp.ErrorID)
+		}
 		return nil, fmt.Errorf("create package failed: %s - %s", pkgResp.Response, pkgResp.Message)
 	}
 
@@ -169,9 +175,9 @@ func generateKeyCode() (string, error) {
 
 // uploadChunk represents work for a single chunk upload.
 type uploadChunk struct {
-	part      int
-	data      []byte
-	uploadURL string // presigned S3 URL
+	part int
+	data []byte
+	url  string // presigned S3 upload URL
 }
 
 // uploadFile uploads a file to the package with parallel chunk uploads.
@@ -197,20 +203,6 @@ func (p *uploadPackage) uploadFile(path string, progress func(bytes, total int64
 		return "", err
 	}
 
-	// Fetch all upload URLs upfront
-	uploadURLs := make(map[int]string, parts)
-	const batchSize = 1000
-	for i := 1; i <= parts; i += batchSize {
-		endPart := min(i+batchSize-1, parts)
-		urlBatch, err := p.getUploadURLsBatch(fileID, i, endPart)
-		if err != nil {
-			return "", fmt.Errorf("fetch upload URLs: %w", err)
-		}
-		for part, url := range urlBatch {
-			uploadURLs[part] = url
-		}
-	}
-
 	// Upload chunks in parallel
 	passphrase := p.serverSecret + p.keyCode
 	workCh := make(chan uploadChunk, 16)
@@ -218,6 +210,7 @@ func (p *uploadPackage) uploadFile(path string, progress func(bytes, total int64
 
 	g, ctx := errgroup.WithContext(context.Background())
 
+	// Workers: encrypt and upload (URLs already fetched)
 	for range 16 {
 		g.Go(func() error {
 			for work := range workCh {
@@ -227,21 +220,39 @@ func (p *uploadPackage) uploadFile(path string, progress func(bytes, total int64
 					return fmt.Errorf("encrypt part %d: %w", work.part, err)
 				}
 
-				// Upload directly to presigned URL (no API round trip)
-				if err := p.uploadToS3(work.uploadURL, encrypted); err != nil {
+				// Upload directly to presigned URL
+				if err := p.uploadToS3(work.url, encrypted); err != nil {
 					return fmt.Errorf("upload part %d: %w", work.part, err)
 				}
 
-				// Update progress counter (progress callback is called by ticker goroutine)
-				uploadedBytes.Add(int64(len(work.data)))
+				// Update progress
+				uploaded := uploadedBytes.Add(int64(len(work.data)))
+				if progress != nil {
+					progress(uploaded, size)
+				}
 			}
 			return nil
 		})
 	}
 
+	// Reader: fetch URLs in batches, read data, send to workers
 	g.Go(func() error {
 		defer close(workCh)
+		partURLs := make(map[int]string)
+
 		for part := 1; part <= parts; part++ {
+			// Fetch more URLs if needed
+			if _, ok := partURLs[part]; !ok {
+				urls, err := p.getUploadURLs(fileID, part)
+				if err != nil {
+					return fmt.Errorf("get upload URLs starting at part %d: %w", part, err)
+				}
+				for p, u := range urls {
+					partURLs[p] = u
+				}
+			}
+
+			url := partURLs[part]
 			offset, length := partBounds(part, size)
 
 			// Read chunk data
@@ -249,19 +260,11 @@ func (p *uploadPackage) uploadFile(path string, progress func(bytes, total int64
 			if _, err := f.ReadAt(data, offset); err != nil && err != io.EOF {
 				return fmt.Errorf("read part %d: %w", part, err)
 			}
-			// Look up pre-fetched URL
-			uploadURL, ok := uploadURLs[part]
-			if !ok {
-				return fmt.Errorf("missing upload URL for part %d", part)
-			}
 
 			select {
-			case workCh <- uploadChunk{part: part, data: data, uploadURL: uploadURL}:
+			case workCh <- uploadChunk{part: part, data: data, url: url}:
 			case <-ctx.Done():
 				return ctx.Err()
-			}
-			if progress != nil {
-				progress(uploadedBytes.Load(), size)
 			}
 		}
 		return nil
@@ -283,9 +286,16 @@ func (p *uploadPackage) uploadFile(path string, progress func(bytes, total int64
 func (p *uploadPackage) finalize(email string) (secureLink string, err error) {
 	urlPath := fmt.Sprintf("/drop-zone/v2.0/package/%s/finalize/", p.packageID)
 
+	// Compute checksum: PBKDF2(keyCode, packageCode, 1024 iterations, 32 bytes)
+	dk, err := pbkdf2.Key(sha256.New, p.keyCode, []byte(p.packageCode), 1024, 32)
+	if err != nil {
+		return "", fmt.Errorf("compute checksum: %w", err)
+	}
+	checksum := hex.EncodeToString(dk)
+
 	body := map[string]interface{}{
-		"keyCode": p.keyCode,
-		"email":   email,
+		"checksum":          checksum,
+		"unconfirmedSender": email,
 	}
 	bodyBytes, _ := json.Marshal(body)
 
@@ -297,17 +307,22 @@ func (p *uploadPackage) finalize(email string) (secureLink string, err error) {
 	var finResp struct {
 		Response string `json:"response"`
 		Message  string `json:"message"`
-		Link     string `json:"link"`
+		ErrorID  string `json:"errorId"`
 	}
 	if err := json.Unmarshal(resp, &finResp); err != nil {
 		return "", fmt.Errorf("parse finalize response: %w", err)
 	}
 
 	if finResp.Response != "SUCCESS" {
+		if finResp.ErrorID != "" {
+			return "", fmt.Errorf("finalize failed: %s - %s (errorId: %s)", finResp.Response, finResp.Message, finResp.ErrorID)
+		}
 		return "", fmt.Errorf("finalize failed: %s - %s", finResp.Response, finResp.Message)
 	}
 
-	return finResp.Link, nil
+	// Construct the full secure link: message contains base URL, append keyCode
+	secureLink = finResp.Message + "#keyCode=" + p.keyCode
+	return secureLink, nil
 }
 
 // submitHostedDropzone submits to the dropzone webhook (for Zendesk integration etc.)
@@ -390,6 +405,7 @@ func (c *dropzoneClient) doRequest(method, urlPath string, body []byte) ([]byte,
 	}
 
 	req.Header.Set("ss-api-key", c.dropzoneID)
+	req.Header.Set("ss-request-api", "NODE_API")
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
@@ -430,9 +446,10 @@ func (p *uploadPackage) createFile(name string, parts int, size int64) (string, 
 	urlPath := fmt.Sprintf("/drop-zone/v2.0/package/%s/file/", p.packageID)
 
 	body := map[string]interface{}{
-		"filename": name,
-		"parts":    parts,
-		"filesize": size,
+		"filename":   name,
+		"uploadType": "NODE_API",
+		"parts":      parts,
+		"filesize":   size,
 	}
 	bodyBytes, _ := json.Marshal(body)
 
@@ -444,6 +461,7 @@ func (p *uploadPackage) createFile(name string, parts int, size int64) (string, 
 	var fileResp struct {
 		Response string `json:"response"`
 		Message  string `json:"message"`
+		ErrorID  string `json:"errorId"`
 		FileID   string `json:"fileId"`
 	}
 	if err := json.Unmarshal(resp, &fileResp); err != nil {
@@ -451,6 +469,9 @@ func (p *uploadPackage) createFile(name string, parts int, size int64) (string, 
 	}
 
 	if fileResp.Response != "SUCCESS" {
+		if fileResp.ErrorID != "" {
+			return "", fmt.Errorf("create file failed: %s - %s (errorId: %s)", fileResp.Response, fileResp.Message, fileResp.ErrorID)
+		}
 		return "", fmt.Errorf("create file failed: %s - %s", fileResp.Response, fileResp.Message)
 	}
 
@@ -469,6 +490,7 @@ func (p *uploadPackage) uploadToS3(uploadURL string, encryptedData []byte) error
 		if err != nil {
 			return err
 		}
+		req.ContentLength = int64(len(encryptedData))
 
 		resp, err := p.client.http.Do(req)
 		if err != nil {
@@ -477,8 +499,8 @@ func (p *uploadPackage) uploadToS3(uploadURL string, encryptedData []byte) error
 		}
 		resp.Body.Close()
 
-		if resp.StatusCode >= 400 {
-			lastErr = fmt.Errorf("S3 upload failed: %d", resp.StatusCode)
+		if resp.StatusCode != 200 {
+			lastErr = fmt.Errorf("S3 upload failed: status %d", resp.StatusCode)
 			continue
 		}
 
@@ -488,15 +510,14 @@ func (p *uploadPackage) uploadToS3(uploadURL string, encryptedData []byte) error
 	return lastErr
 }
 
-// getUploadURLsBatch fetches presigned upload URLs for a range of parts.
-// Returns a map of part number to presigned URL.
-func (p *uploadPackage) getUploadURLsBatch(fileID string, startPart, endPart int) (map[int]string, error) {
+// getUploadURLs fetches presigned upload URLs starting from a given part.
+// Returns a map of part number -> URL (up to 25 URLs).
+func (p *uploadPackage) getUploadURLs(fileID string, startPart int) (map[int]string, error) {
 	urlPath := fmt.Sprintf("/drop-zone/v2.0/package/%s/file/%s/upload-urls/", p.packageID, fileID)
 
-	// Try batch request first (similar to download URL batching)
 	body := map[string]interface{}{
-		"startPart": startPart,
-		"endPart":   endPart,
+		"part":       startPart,
+		"forceProxy": false,
 	}
 	bodyBytes, _ := json.Marshal(body)
 
@@ -518,38 +539,61 @@ func (p *uploadPackage) getUploadURLsBatch(fileID string, startPart, endPart int
 	}
 
 	if urlResp.Response != "SUCCESS" {
-		return nil, fmt.Errorf("get upload URLs failed: %s - %s", urlResp.Response, urlResp.Message)
+		return nil, fmt.Errorf("get upload URLs failed: %s (raw: %s)", urlResp.Response, string(resp))
 	}
 
-	// Build map of part -> URL
-	urlMap := make(map[int]string, len(urlResp.UploadUrls))
-	for _, entry := range urlResp.UploadUrls {
-		urlMap[entry.Part] = entry.URL
+	if len(urlResp.UploadUrls) == 0 {
+		return nil, fmt.Errorf("no upload URLs returned starting at part %d", startPart)
 	}
 
-	return urlMap, nil
+	urls := make(map[int]string, len(urlResp.UploadUrls))
+	for _, u := range urlResp.UploadUrls {
+		urls[u.Part] = u.URL
+	}
+	return urls, nil
 }
 
 // markUploadComplete marks a file upload as complete.
+// Polls until the server confirms the file is fully processed.
 func (p *uploadPackage) markUploadComplete(fileID string) error {
 	urlPath := fmt.Sprintf("/drop-zone/v2.0/package/%s/file/%s/upload-complete/", p.packageID, fileID)
 
-	resp, err := p.client.doRequest("POST", urlPath, nil)
-	if err != nil {
-		return err
+	body := map[string]interface{}{
+		"complete": true,
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	// Poll until server confirms complete (message == "true")
+	for attempt := 0; attempt < 30; attempt++ {
+		resp, err := p.client.doRequest("POST", urlPath, bodyBytes)
+		if err != nil {
+			return err
+		}
+
+		var completeResp struct {
+			Response string `json:"response"`
+			Message  string `json:"message"`
+			ErrorID  string `json:"errorId"`
+		}
+		if err := json.Unmarshal(resp, &completeResp); err != nil {
+			return err
+		}
+
+		if completeResp.Response != "SUCCESS" {
+			if completeResp.ErrorID != "" {
+				return fmt.Errorf("mark complete failed: %s - %s (errorId: %s)", completeResp.Response, completeResp.Message, completeResp.ErrorID)
+			}
+			return fmt.Errorf("mark complete failed: %s - %s", completeResp.Response, completeResp.Message)
+		}
+
+		// Server returns message="true" when file is fully processed
+		if completeResp.Message == "true" {
+			return nil
+		}
+
+		// Not ready yet, wait and retry (like JS SDK does)
+		time.Sleep(2 * time.Second)
 	}
 
-	var completeResp struct {
-		Response string `json:"response"`
-		Message  string `json:"message"`
-	}
-	if err := json.Unmarshal(resp, &completeResp); err != nil {
-		return err
-	}
-
-	if completeResp.Response != "SUCCESS" {
-		return fmt.Errorf("mark complete failed: %s - %s", completeResp.Response, completeResp.Message)
-	}
-
-	return nil
+	return fmt.Errorf("mark complete timed out waiting for server confirmation")
 }
