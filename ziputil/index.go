@@ -1,18 +1,16 @@
-package ss
+package ziputil
 
 import (
 	"bytes"
-	"compress/flate"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
-	"time"
 
-	"golang.org/x/sync/errgroup"
+	"github.com/dt/gosendsafely/stream"
+	"github.com/dt/gosendsafely/util"
 )
 
 var (
@@ -23,14 +21,35 @@ var (
 	zip64EOCDSig = []byte{0x50, 0x4b, 0x06, 0x06}
 )
 
+type span struct {
+	offset int
+	length int
+}
+
+// ZippedFile represents a file entry in a ZIP archive.
+type ZippedFile struct {
+	Name        string
+	Size        util.BytesSize
+	src         span
+	compression uint16
+}
+
+// CompressedSize returns the compressed size of the file in the archive.
+func (z *ZippedFile) CompressedSize() util.BytesSize {
+	return util.BytesSize(z.src.length)
+}
+
+// ZipIndex is a list of files in a ZIP archive.
+type ZipIndex []ZippedFile
+
 // DecodeIndex reads the ZIP central directory from a chunked file and returns
 // an index of all files in the archive.
-func DecodeIndex[T any](src *ChunkedFile[T]) (ZipIndex, error) {
+func DecodeIndex[T any](src *stream.ChunkedFile[T]) (ZipIndex, error) {
 	// Step 1: Read last 4KB to find EOCD
 	const initialTailSize = 4 << 10 // 4KB
-	tailSize := min(initialTailSize, src.size)
+	tailSize := min(initialTailSize, src.Size())
 
-	tail, err := readRange(src, src.size-tailSize, tailSize)
+	tail, err := readRange(src, src.Size()-tailSize, tailSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read tail: %w", err)
 	}
@@ -44,7 +63,7 @@ func DecodeIndex[T any](src *ChunkedFile[T]) (ZipIndex, error) {
 	}
 
 	// Parse EOCD to get CD location
-	cdOffset, cdSize, err := parseEOCD(tail, eocdPos, src.size-tailSize, src.size)
+	cdOffset, cdSize, err := parseEOCD(tail, eocdPos, src.Size()-tailSize, src.Size())
 	if err != nil {
 		return nil, err
 	}
@@ -52,9 +71,9 @@ func DecodeIndex[T any](src *ChunkedFile[T]) (ZipIndex, error) {
 	// Handle ZIP64 - need more data
 	if cdOffset == 0xFFFFFFFF || cdSize == 0xFFFFFFFF {
 		// Expand read to include ZIP64 structures (need ~100 bytes before EOCD)
-		expandedSize := min(tailSize+1024, src.size)
+		expandedSize := min(tailSize+1024, src.Size())
 		if expandedSize > tailSize {
-			tail, err = readRange(src, src.size-expandedSize, expandedSize)
+			tail, err = readRange(src, src.Size()-expandedSize, expandedSize)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read expanded tail for ZIP64: %w", err)
 			}
@@ -64,7 +83,7 @@ func DecodeIndex[T any](src *ChunkedFile[T]) (ZipIndex, error) {
 			}
 		}
 
-		cdOffset, cdSize, err = parseZip64EOCD(tail, eocdPos, src.size-len(tail))
+		cdOffset, cdSize, err = parseZip64EOCD(tail, eocdPos, src.Size()-len(tail))
 		if err != nil {
 			return nil, err
 		}
@@ -76,7 +95,7 @@ func DecodeIndex[T any](src *ChunkedFile[T]) (ZipIndex, error) {
 	}
 
 	// Check if CD is already in our tail buffer
-	bufferStart := src.size - len(tail)
+	bufferStart := src.Size() - len(tail)
 	cdLocalOffset := cdOffset - bufferStart
 
 	var cdData []byte
@@ -95,20 +114,13 @@ func DecodeIndex[T any](src *ChunkedFile[T]) (ZipIndex, error) {
 }
 
 // readRange reads a range of bytes from the chunked file.
-func readRange[T any](src *ChunkedFile[T], offset, length int) ([]byte, error) {
-	buf := make([]byte, length)
-	r := src.reader(span{offset: offset, length: length})
-	defer r.Close()
+func readRange[T any](src *stream.ChunkedFile[T], offset, length int) ([]byte, error) {
+	// Enable pinning mode to prevent chunk eviction for potential re-reads during recovery
+	defer src.PinReadChunks()()
 
-	// double-ref any ref'ed chunks to effectively pin them in case we end up
-	// re-reading them in an expanded CD recovery pass later.
-	for i := len(src.chunks)-1; i >= 0; i-- {
-		if c := src.chunks[i].refCnt.Load(); c == 1 {
-			src.chunks[i].ref()
-		} else if c == 0 {
-			break
-		}
-	}
+	buf := make([]byte, length)
+	r := src.Reader(offset, length)
+	defer r.Close()
 
 	if err := src.FetchChunks(context.Background(), nil); err != nil {
 		return nil, err
@@ -179,16 +191,16 @@ func parseZip64EOCD(buf []byte, eocdPos, bufferStartOffset int) (cdOffset, cdSiz
 
 // recoverCDIndex attempts to recover CD entries from a truncated ZIP
 // by scanning backwards from EOF to find CD signatures.
-func recoverCDIndex[T any](src *ChunkedFile[T]) (ZipIndex, error) {
-	const chunkSize = 512 << 10  // 512KB chunks for scanning
+func recoverCDIndex[T any](src *stream.ChunkedFile[T]) (ZipIndex, error) {
+	const chunkSize = 512 << 10 // 512KB chunks for scanning
 	const maxSearch = 64 << 20  // Search up to 64MB from EOF
 	const gapLimit = 256 << 10  // Stop if gap > 256KB with no CDs
 
-	searchLimit := min(maxSearch, src.size)
-	earliestCDOffset := src.size // Track earliest CD we've found
+	searchLimit := min(maxSearch, src.Size())
+	earliestCDOffset := src.Size() // Track earliest CD we've found
 
 	// Probe backwards to find where CDs start
-	for probeEnd := src.size; probeEnd > src.size-searchLimit; {
+	for probeEnd := src.Size(); probeEnd > src.Size()-searchLimit; {
 		probeStart := max(0, probeEnd-chunkSize)
 		probeLen := probeEnd - probeStart
 
@@ -209,12 +221,12 @@ func recoverCDIndex[T any](src *ChunkedFile[T]) (ZipIndex, error) {
 			}
 		}
 
-		if !foundInChunk && earliestCDOffset < src.size {
+		if !foundInChunk && earliestCDOffset < src.Size() {
 			// We found CDs before but not in this chunk - we've hit the start
 			break
 		}
 
-		if !foundInChunk && src.size-probeStart > gapLimit {
+		if !foundInChunk && src.Size()-probeStart > gapLimit {
 			// Large gap with no CDs and we haven't found any yet
 			return nil, fmt.Errorf("no Central Directory entries found in first %d bytes from EOF", gapLimit)
 		}
@@ -222,12 +234,12 @@ func recoverCDIndex[T any](src *ChunkedFile[T]) (ZipIndex, error) {
 		probeEnd = probeStart
 	}
 
-	if earliestCDOffset >= src.size {
+	if earliestCDOffset >= src.Size() {
 		return nil, fmt.Errorf("no Central Directory entries found")
 	}
 
 	// Read from earliest CD to EOF and parse
-	cdData, err := readRange(src, earliestCDOffset, src.size-earliestCDOffset)
+	cdData, err := readRange(src, earliestCDOffset, src.Size()-earliestCDOffset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read recovered CD region: %w", err)
 	}
@@ -255,7 +267,7 @@ func parseCDEntries(cdData []byte) (ZipIndex, error) {
 		entry.compression = uint16(cdData[pos+10]) | uint16(cdData[pos+11])<<8
 		entry.src.length = int(uint32(cdData[pos+20]) | uint32(cdData[pos+21])<<8 |
 			uint32(cdData[pos+22])<<16 | uint32(cdData[pos+23])<<24)
-		entry.Size = BytesSize(uint32(cdData[pos+24]) | uint32(cdData[pos+25])<<8 |
+		entry.Size = util.BytesSize(uint32(cdData[pos+24]) | uint32(cdData[pos+25])<<8 |
 			uint32(cdData[pos+26])<<16 | uint32(cdData[pos+27])<<24)
 		fileNameLength := uint16(cdData[pos+28]) | uint16(cdData[pos+29])<<8
 
@@ -285,7 +297,7 @@ func parseCDEntries(cdData []byte) (ZipIndex, error) {
 					z64 := extra[i+4 : i+4+int(size)]
 					offset := 0
 					if entry.Size == 0xFFFFFFFF && offset+8 <= len(z64) {
-						entry.Size = BytesSize(uint64(z64[offset]) | uint64(z64[offset+1])<<8 |
+						entry.Size = util.BytesSize(uint64(z64[offset]) | uint64(z64[offset+1])<<8 |
 							uint64(z64[offset+2])<<16 | uint64(z64[offset+3])<<24 |
 							uint64(z64[offset+4])<<32 | uint64(z64[offset+5])<<40 |
 							uint64(z64[offset+6])<<48 | uint64(z64[offset+7])<<56)
@@ -365,29 +377,6 @@ func (i ZipIndex) Filtered(includes, excludes []string) []ZippedFile {
 	return result
 }
 
-// ZippedFile represents a file entry in a ZIP archive.
-type ZippedFile struct {
-	Name string
-	Size BytesSize
-	src  span
-	compression uint16
-}
-
-type extraction struct {
-	src io.ReadSeekCloser
-	out string
-	srcSize int64
-	compression uint16
-}
-
-// CompressedSize returns the compressed size of the file in the archive.
-func (z *ZippedFile) CompressedSize() BytesSize {
-	return BytesSize(z.src.length)
-}
-
-// ZipIndex is a list of files in a ZIP archive.
-type ZipIndex []ZippedFile
-
 // StripCommonPrefix removes a common folder prefix from all entries if every
 // entry shares the same top-level directory. Returns the prefix that was stripped.
 func (idx ZipIndex) StripCommonPrefix() string {
@@ -429,149 +418,3 @@ func (idx ZipIndex) StripCommonPrefix() string {
 
 	return commonPrefix
 }
-
-// Extract extracts files from the index to dest, skipping files that already
-// exist with the correct size. Returns the number of skipped files and their
-// total size.
-func Extract[T any](
-	src *ChunkedFile[T], index ZipIndex, dest string, lim Sem, progress func(float64, BytesSize),
-) (int, BytesSize, error) {
-	extractions := make(chan extraction, len(index))
-
-	var totalSize int
-	var existingSize, existingFiles BytesSize
-	for _, i := range index {
-		totalSize += int(i.CompressedSize())
-		// Expand range to include local file header (30 bytes + filename + extra field)
-		headerEstimate := 30 + len(i.Name) + 256
-		expandedSpan := span{offset: i.src.offset, length: i.src.length + headerEstimate}
-		out := filepath.Join(dest, i.Name)
-		if s, err := os.Stat(out); err == nil && s.Size() == int64(i.Size) {
-			// File already exists with correct size, skip extraction
-			existingFiles++
-			existingSize += BytesSize(i.CompressedSize())
-			continue
-		}
-		extractions <- extraction{
-			src: src.reader(expandedSpan),
-			out: out,
-			srcSize: int64(i.CompressedSize()),
-			compression: i.compression,
-		}
-	}
-	close(extractions)
-
-	var finished atomic.Int64
-	finished.Add(int64(existingSize))
-	g, ctx := errgroup.WithContext(context.Background())
-	done := ctx.Done()
-	poll := make(chan struct{})
-	g.Go(func() error {
-		defer close(poll)
-		return src.FetchChunks(ctx, lim)
-	})
-
-	for range 4 {
-		g.Go(func() error {
-			for {
-				select {
-				case <-done:
-					return ctx.Err()
-				case ex, ok := <-extractions:
-					if !ok {
-						return nil
-					}
-					if err := ex.write(); err != nil {
-						return err
-					}
-					finished.Add(ex.srcSize)
-				}
-			}
-		})
-	}
-
-	lastProg := BytesSize(finished.Load())
-	lastReport := time.Now()
-	for {
-		select {
-		case <-poll:
-			return int(existingFiles), existingSize, g.Wait()
-		case <-time.After(time.Second):
-			if progress != nil {
-				cur := BytesSize(finished.Load())
-				delta := BytesSize(float64(cur - lastProg) / time.Since(lastReport).Seconds())
-				lastProg = cur
-				lastReport = time.Now()
-				progress(float64(cur) / float64(totalSize), delta)
-			}
-		}
-	}
-}	
-
-func (e *extraction) write() error {
-	defer e.src.Close()
-
-	var header [30]byte
-	_, err := io.ReadFull(e.src, header[:])
-	if err != nil {
-		return err
-	}
-
-	
-	// Verify signature
-	if !bytes.Equal(header[0:4], fileSig) {
-		return fmt.Errorf("invalid local file header signature")
-	}
-
-	// Decode variable field lengths from local header (may differ from CD).
-	localFileNameLen := uint16(header[26]) | uint16(header[27])<<8
-	localExtraLen := uint16(header[28]) | uint16(header[29])<<8
-
-	// Advance past variable fields to start of file data.
-	skip := localExtraLen + localFileNameLen
-	if skip > 0 {
-		_, err := e.src.Seek(int64(skip), io.SeekCurrent)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Create an output tmp file.
-	if err := os.MkdirAll(filepath.Dir(e.out), 0755); err != nil {
-		return err
-	}
-	tmpName := e.out + ".download-tmp"
-
-	f, err := os.Create(tmpName)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if f != nil {
-			f.Close()
-		}
-	}()
-
-	// Copy the file data, decompressing if needed, to the output file.
-	switch e.compression {
-	case 0: // Stored
-		_, err = io.Copy(f, e.src)
-	case 8: // Deflate
-		ex := flate.NewReader(e.src)
-		defer ex.Close()
-		_, err = io.Copy(f, ex)
-	default:
-		return fmt.Errorf("unsupported compression method %d", e.compression)
-	}
-	if err == nil {
-		err = f.Close()
-		f = nil
-	}
-
-	if err != nil {
-		os.Remove(tmpName)
-		return err
-	} 
-	return os.Rename(tmpName, e.out)
-}
-

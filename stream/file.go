@@ -1,4 +1,4 @@
-package ss
+package stream
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dt/gosendsafely/util"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -16,24 +17,83 @@ type span struct {
 	length int
 }
 
-// Chunk represents a segment of a chunked file that can be fetched on demand.
-type Chunk[T any] struct {
-	ID  T
-	Idx int
+// chunk represents a segment of a chunked file that can be fetched on demand.
+// All fields are private to hide implementation details.
+type chunk[T any] struct {
+	id  T
+	idx int
 	span
 
 	refCnt  atomic.Int64
 	ready   chan struct{}
 	err     error
 	content []byte
-	lim     Sem
+	lim     util.Sem
 }
 
 type ChunkedFile[T any] struct {
 	name    string
 	size    int
-	chunks  []Chunk[T]
+	chunks  []chunk[T]
 	fetcher func(id T) ([]byte, error)
+	pinning bool // If true, chunks are double-ref'd to pin them in memory
+}
+
+// NewChunkedFile creates a chunked file from chunk IDs.
+// - name: file name
+// - totalSize: total file size in bytes
+// - chunkIDs: slice of chunk identifiers (length = number of chunks)
+// - nominalChunkSize: standard chunk size (all chunks except last and prefetched)
+// - fetcher: function to fetch chunk content by ID
+// - prefetched: optional map of pre-fetched chunk content (index -> bytes)
+//
+// Chunk sizes are determined as:
+// - If chunk index is in prefetched map: size = len(prefetched[idx])
+// - Else if chunk is last: size = remaining bytes to reach totalSize
+// - Else: size = nominalChunkSize
+//
+// Offsets are calculated automatically based on chunk sizes.
+func NewChunkedFile[T any](
+	name string,
+	totalSize int,
+	chunkIDs []T,
+	nominalChunkSize int,
+	fetcher func(T) ([]byte, error),
+	prefetched map[int][]byte,
+) *ChunkedFile[T] {
+	chunks := make([]chunk[T], len(chunkIDs))
+	offset := 0
+
+	for i := range chunks {
+		chunks[i].id = chunkIDs[i]
+		chunks[i].idx = i
+		chunks[i].offset = offset
+
+		// Determine chunk length
+		if content, ok := prefetched[i]; ok {
+			// Prefetched chunk - use actual content size
+			chunks[i].length = len(content)
+			chunks[i].content = content
+			chunks[i].refCnt.Store(1)         // Mark as pinned
+			chunks[i].ready = make(chan struct{})
+			close(chunks[i].ready) // Already has content
+		} else if i == len(chunkIDs)-1 {
+			// Last chunk - remaining bytes
+			chunks[i].length = totalSize - offset
+		} else {
+			// Normal chunk - use nominal size
+			chunks[i].length = nominalChunkSize
+		}
+
+		offset += chunks[i].length
+	}
+
+	return &ChunkedFile[T]{
+		name:    name,
+		size:    totalSize,
+		chunks:  chunks,
+		fetcher: fetcher,
+	}
 }
 
 // Size returns the total size of the file in bytes.
@@ -46,13 +106,16 @@ func (c *ChunkedFile[T]) Name() string {
 	return c.name
 }
 
-// reader returns a reader for the given span. It refs all chunks needed for
-// the span; callers must Close the reader to release these refs.
+// Reader returns a reader for the given offset and length. It refs all chunks
+// needed for the span; callers must Close the reader to release these refs.
+// If pinning mode is active, chunks are double-ref'd to keep them in memory.
 //
-// Concurrency: reader must not be called concurrently with FetchChunks. All
+// Concurrency: Reader must not be called concurrently with FetchChunks. All
 // readers should be opened before FetchChunks runs; no new readers should be
 // opened until FetchChunks completes.
-func (c *ChunkedFile[T]) reader(s span) io.ReadSeekCloser {
+func (c *ChunkedFile[T]) Reader(offset, length int) io.ReadSeekCloser {
+	s := span{offset: offset, length: length}
+
 	// Find first chunk needed for span.
 	start := 0
 	if s.offset > 0 {
@@ -67,6 +130,10 @@ func (c *ChunkedFile[T]) reader(s span) io.ReadSeekCloser {
 			break
 		}
 		c.chunks[i+start].ref()
+		// If pinning mode is active, double-ref to pin the chunk
+		if c.pinning {
+			c.chunks[i+start].ref()
+		}
 	}
 
 	return &chunkReader[T]{
@@ -76,15 +143,26 @@ func (c *ChunkedFile[T]) reader(s span) io.ReadSeekCloser {
 	}
 }
 
+// PinReadChunks enables pinning mode for all readers opened until the returned
+// cleanup function is called. In pinning mode, chunks are double-ref'd to keep
+// them in memory for repeated reads (e.g., ZIP recovery).
+// Usage: defer file.PinReadChunks()()
+func (c *ChunkedFile[T]) PinReadChunks() func() {
+	c.pinning = true
+	return func() {
+		c.pinning = false
+	}
+}
+
 // FetchChunks fetches all referenced chunks concurrently. It skips chunks that
 // already have content or have no references.
 //
 // Concurrency: all readers should be opened before calling FetchChunks, and no
-// new readers should be opened until it completes. See reader() for details.
-func (c *ChunkedFile[T]) FetchChunks(ctx context.Context, lim Sem) error {
+// new readers should be opened until it completes. See Reader() for details.
+func (c *ChunkedFile[T]) FetchChunks(ctx context.Context, lim util.Sem) error {
 	g, ctx := errgroup.WithContext(ctx)
 	done := ctx.Done()
-	reqs := make(chan *Chunk[T], 1)
+	reqs := make(chan *chunk[T], 1)
 
 	for range 12 {
 		g.Go(func() error {
@@ -93,9 +171,11 @@ func (c *ChunkedFile[T]) FetchChunks(ctx context.Context, lim Sem) error {
 
 				select {
 				case <-done:
+					lim.Release()
 					return ctx.Err()
 				case req, ok := <-reqs:
 					if !ok {
+						lim.Release()
 						return nil
 					}
 					// Best-effort optimization: skip chunks no longer needed. This
@@ -103,10 +183,13 @@ func (c *ChunkedFile[T]) FetchChunks(ctx context.Context, lim Sem) error {
 					// the fetch, set content, then immediately clear it when our
 					// unref observes no remaining refs.
 					if req.refCnt.Load() == 0 {
+						lim.Release()
 						continue
 					}
 
-					content, err := c.fetcher(req.ID)
+					// Set lim so unref() can release when chunk is consumed
+					req.lim = lim
+					content, err := c.fetcher(req.id)
 					// Ref the chunk to prevent its count going to zero while we set
 					// content. If all readers unref'd during the fetch (count went to
 					// zero), this ref creates a new ready channel that our subsequent
@@ -134,14 +217,14 @@ func (c *ChunkedFile[T]) FetchChunks(ctx context.Context, lim Sem) error {
 		}
 	}
 	close(reqs)
-	if err := g.Wait(); err != nil {	
+	if err := g.Wait(); err != nil {
 		return err
 	}
 	return nil
 }
 
 type chunkReader[T any] struct {
-	src  []Chunk[T]
+	src  []chunk[T]
 	span span
 	n    int
 	cur  int
@@ -168,16 +251,16 @@ func (r *chunkReader[T]) Read(p []byte) (int, error) {
 	select {
 	case <-r.src[r.cur].ready:
 	case <-time.After(5 * time.Minute):
-		return 0, fmt.Errorf("timeout waiting for chunk %d", r.src[r.cur].Idx)
+		return 0, fmt.Errorf("timeout waiting for chunk %d", r.src[r.cur].idx)
 	}
 
 	if r.src[r.cur].err != nil {
 		return 0, r.src[r.cur].err
 	}
 
-	if len(r.src[r.cur].content) !=  r.src[r.cur].length {
-		return 0, fmt.Errorf("chunk %d has incorrect content size %d != %d", 
-			r.src[r.cur].Idx, len(r.src[r.cur].content), r.src[r.cur].length	)
+	if len(r.src[r.cur].content) != r.src[r.cur].length {
+		return 0, fmt.Errorf("chunk %d has incorrect content size %d != %d",
+			r.src[r.cur].idx, len(r.src[r.cur].content), r.src[r.cur].length)
 	}
 
 	// Calculate slice bounds within the current chunk.
@@ -187,7 +270,7 @@ func (r *chunkReader[T]) Read(p []byte) (int, error) {
 	end := min(len(r.src[r.cur].content), spanEndInChunk)
 
 	if start >= end || start < 0 {
-		return 0, fmt.Errorf("invalid read bounds: start=%d end=%d chunk=%d", start, end, r.src[r.cur].Idx)
+		return 0, fmt.Errorf("invalid read bounds: start=%d end=%d chunk=%d", start, end, r.src[r.cur].idx)
 	}
 
 	n := copy(p, r.src[r.cur].content[start:end])
@@ -195,8 +278,8 @@ func (r *chunkReader[T]) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (r *chunkReader[T]) Seek(n int64, wence int) (int64, error) {
-	if wence != io.SeekCurrent {
+func (r *chunkReader[T]) Seek(n int64, whence int) (int64, error) {
+	if whence != io.SeekCurrent {
 		return 0, fmt.Errorf("unsupported seek")
 	}
 	r.n += int(n)
@@ -210,12 +293,12 @@ func (r *chunkReader[T]) Close() error {
 	return nil
 }
 
-func (c *Chunk[T]) setErr(err error) {
+func (c *chunk[T]) setErr(err error) {
 	c.err = err
 	close(c.ready)
 }
 
-func (c *Chunk[T]) setContent(b []byte) {
+func (c *chunk[T]) setContent(b []byte) {
 	c.content = b
 	close(c.ready)
 }
@@ -226,7 +309,7 @@ func (c *Chunk[T]) setContent(b []byte) {
 // Concurrency: ref is called during reader creation (before fetching) and by
 // FetchChunks workers before setting content. These phases don't overlap, so
 // ref calls don't race with each other or with unref.
-func (c *Chunk[T]) ref() {
+func (c *chunk[T]) ref() {
 	if c.refCnt.Add(1) == 1 {
 		c.ready = make(chan struct{})
 	}
@@ -239,11 +322,10 @@ func (c *Chunk[T]) ref() {
 // Concurrency: unref is called concurrently by reader goroutines as they finish
 // reading individual chunks, and by FetchChunks workers after setting content.
 // The atomic refCnt ensures exactly one caller sees count→0 and clears state.
-func (c *Chunk[T]) unref() {
+func (c *chunk[T]) unref() {
 	if c.refCnt.Add(-1) == 0 {
 		c.content = nil
 		c.ready = nil
 		c.lim.Release()
 	}
 }
-

@@ -1,4 +1,4 @@
-package ss
+package sendsafely
 
 import (
 	"bytes"
@@ -133,23 +133,42 @@ func (m *mockDropzoneServer) handlePackage(w http.ResponseWriter, r *http.Reques
 
 		var body map[string]interface{}
 		json.NewDecoder(r.Body).Decode(&body)
-		part := int(body["part"].(float64))
 
-		if part < 1 || part > file.parts {
-			json.NewEncoder(w).Encode(map[string]string{
-				"response": "INVALID_PART",
+		// Support both single part and range-based batch requests
+		var partsToFetch []int
+		if startPart, ok := body["startPart"].(float64); ok {
+			// Batch request with range
+			endPart := int(body["endPart"].(float64))
+			for i := int(startPart); i <= endPart; i++ {
+				partsToFetch = append(partsToFetch, i)
+			}
+		} else if part, ok := body["part"].(float64); ok {
+			// Single part request
+			partsToFetch = []int{int(part)}
+		}
+
+		// Validate all parts are in range
+		for _, part := range partsToFetch {
+			if part < 1 || part > file.parts {
+				json.NewEncoder(w).Encode(map[string]string{
+					"response": "INVALID_PART",
+				})
+				return
+			}
+		}
+
+		// Generate URLs for all requested parts
+		var uploadUrls []map[string]interface{}
+		for _, part := range partsToFetch {
+			uploadUrls = append(uploadUrls, map[string]interface{}{
+				"part": part,
+				"url":  m.Server.URL + "/upload/" + packageID + "/" + fileID + "/" + itoa(part),
 			})
-			return
 		}
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"response": "SUCCESS",
-			"uploadUrls": []map[string]interface{}{
-				{
-					"part": part,
-					"url":  m.Server.URL + "/upload/" + packageID + "/" + fileID + "/" + itoa(part),
-				},
-			},
+			"response":   "SUCCESS",
+			"uploadUrls": uploadUrls,
 		})
 		return
 	}
@@ -211,13 +230,24 @@ func (m *mockDropzoneServer) handleUpload(w http.ResponseWriter, r *http.Request
 }
 
 func (m *mockDropzoneServer) handleSubmit(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("ss-api-key") != m.dropzoneID {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if r.FormValue("publicApiKey") != m.dropzoneID {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": "false",
+			"error":   "invalid dropzone",
+		})
 		return
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"response": "SUCCESS",
+		"success":         "true",
+		"data":            "mock-data",
+		"digest":          "mock-digest",
+		"integrationUrls": []string{},
 	})
 }
 
@@ -251,14 +281,15 @@ func TestComputeParts(t *testing.T) {
 		size     int64
 		expected int
 	}{
-		{0, 1},                                   // Empty file
-		{100, 1},                                 // Small file
-		{FirstSegmentSize, 1},                    // Exactly first segment
-		{FirstSegmentSize + 1, 2},                // Just over first segment
-		{FirstSegmentSize + SegmentSize, 2},      // First + one full segment
-		{FirstSegmentSize + SegmentSize + 1, 3},  // Need third part
-		{FirstSegmentSize + SegmentSize*2, 3},    // First + two full segments
-		{FirstSegmentSize + SegmentSize*10, 11},  // Large file
+		{0, 1},                    // Empty file
+		{1, 1},                    // 1 byte
+		{100, 1},                  // Small file
+		{segmentSize - 1, 1},      // Just under one segment
+		{segmentSize, 1},          // Exactly one segment
+		{segmentSize + 1, 2},      // Just over one segment
+		{segmentSize * 2, 2},      // Two full segments
+		{segmentSize*2 + 1, 3},    // Need third part
+		{segmentSize * 10, 10},    // Large file
 	}
 
 	for _, tc := range tests {
@@ -280,18 +311,18 @@ func TestPartBounds(t *testing.T) {
 		// Small file (one part)
 		{1, 1000, 0, 1000},
 
-		// File exactly FirstSegmentSize
-		{1, FirstSegmentSize, 0, FirstSegmentSize},
+		// File exactly segmentSize
+		{1, segmentSize, 0, segmentSize},
 
 		// File with two parts
-		{1, FirstSegmentSize + 1000, 0, FirstSegmentSize},
-		{2, FirstSegmentSize + 1000, FirstSegmentSize, 1000},
+		{1, segmentSize + 1000, 0, segmentSize},
+		{2, segmentSize + 1000, segmentSize, 1000},
 
 		// File with multiple parts
-		{1, int64(FirstSegmentSize + SegmentSize*2 + 500), 0, FirstSegmentSize},
-		{2, int64(FirstSegmentSize + SegmentSize*2 + 500), FirstSegmentSize, SegmentSize},
-		{3, int64(FirstSegmentSize + SegmentSize*2 + 500), int64(FirstSegmentSize + SegmentSize), SegmentSize},
-		{4, int64(FirstSegmentSize + SegmentSize*2 + 500), int64(FirstSegmentSize + SegmentSize*2), 500},
+		{1, int64(segmentSize*3 + 500), 0, segmentSize},
+		{2, int64(segmentSize*3 + 500), segmentSize, segmentSize},
+		{3, int64(segmentSize*3 + 500), int64(segmentSize * 2), segmentSize},
+		{4, int64(segmentSize*3 + 500), int64(segmentSize * 3), 500},
 	}
 
 	for _, tc := range tests {
@@ -308,7 +339,7 @@ func TestEncryptDecryptRoundTrip(t *testing.T) {
 	original := []byte("Hello, World! This is test data for encryption.")
 	passphrase := "server-secret-123keycode-456"
 
-	encrypted, err := EncryptPGP(original, passphrase)
+	encrypted, err := encryptPGP(original, passphrase)
 	if err != nil {
 		t.Fatalf("EncryptPGP failed: %v", err)
 	}
@@ -336,58 +367,64 @@ func TestDropzoneClient_CreatePackage(t *testing.T) {
 	server := newMockDropzoneServer()
 	defer server.Close()
 
-	client := NewDropzoneClient(server.Server.URL, server.dropzoneID)
-	pkg, err := client.CreatePackage()
+	client := newdropzoneClient(server.Server.URL, server.dropzoneID)
+	pkg, err := client.createPackage()
 	if err != nil {
-		t.Fatalf("CreatePackage failed: %v", err)
+		t.Fatalf("createPackage failed: %v", err)
 	}
 
-	if pkg.PackageID == "" {
-		t.Error("PackageID should not be empty")
+	if pkg.packageID == "" {
+		t.Error("packageID should not be empty")
 	}
-	if pkg.PackageCode == "" {
-		t.Error("PackageCode should not be empty")
+	if pkg.packageCode == "" {
+		t.Error("packageCode should not be empty")
 	}
-	if pkg.ServerSecret == "" {
-		t.Error("ServerSecret should not be empty")
+	if pkg.serverSecret == "" {
+		t.Error("serverSecret should not be empty")
 	}
-	if len(pkg.KeyCode) != 64 {
-		t.Errorf("KeyCode should be 64 chars, got %d", len(pkg.KeyCode))
+	if len(pkg.keyCode) != 64 {
+		t.Errorf("keyCode should be 64 chars, got %d", len(pkg.keyCode))
 	}
 }
 
-// TestUploadPackage_AddFile tests uploading a file.
-func TestUploadPackage_AddFile(t *testing.T) {
+// TestUploadPackage_uploadFile tests uploading a file.
+func TestUploadPackage_uploadFile(t *testing.T) {
 	server := newMockDropzoneServer()
 	defer server.Close()
 
-	client := NewDropzoneClient(server.Server.URL, server.dropzoneID)
-	pkg, err := client.CreatePackage()
+	client := newdropzoneClient(server.Server.URL, server.dropzoneID)
+	pkg, err := client.createPackage()
 	if err != nil {
-		t.Fatalf("CreatePackage failed: %v", err)
+		t.Fatalf("createPackage failed: %v", err)
 	}
 
-	// Create test data (small enough for one part)
+	// Create a temp file
+	tmpDir, err := os.MkdirTemp("", "upload-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
 	testData := []byte("This is test file content for upload testing.")
-	reader := bytes.NewReader(testData)
+	testPath := filepath.Join(tmpDir, "test.txt")
+	if err := os.WriteFile(testPath, testData, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
 
 	var progressCalls int
-	fileID, err := pkg.AddFile("test.txt", reader, int64(len(testData)), func(p UploadProgress) {
+	fileID, err := pkg.uploadFile(testPath, func(bytes, total int64) {
 		progressCalls++
-		if p.FileName != "test.txt" {
-			t.Errorf("Progress filename = %s, want test.txt", p.FileName)
-		}
 	})
 	if err != nil {
-		t.Fatalf("AddFile failed: %v", err)
+		t.Fatalf("uploadFile failed: %v", err)
 	}
 
 	if fileID == "" {
-		t.Error("FileID should not be empty")
+		t.Error("fileID should not be empty")
 	}
 
-	if progressCalls != 1 {
-		t.Errorf("Progress called %d times, want 1", progressCalls)
+	if progressCalls < 1 {
+		t.Errorf("Progress called %d times, want at least 1", progressCalls)
 	}
 
 	// Verify data was uploaded and can be decrypted
@@ -398,7 +435,7 @@ func TestUploadPackage_AddFile(t *testing.T) {
 	}
 
 	// Decrypt and verify
-	passphrase := pkg.ServerSecret + pkg.KeyCode
+	passphrase := pkg.serverSecret + pkg.keyCode
 	md, err := openpgp.ReadMessage(bytes.NewReader(encrypted), nil, func(keys []openpgp.Key, symmetric bool) ([]byte, error) {
 		return []byte(passphrase), nil
 	}, nil)
@@ -412,31 +449,40 @@ func TestUploadPackage_AddFile(t *testing.T) {
 	}
 }
 
-// TestUploadPackage_AddFile_MultiPart tests uploading a file with multiple parts.
-func TestUploadPackage_AddFile_MultiPart(t *testing.T) {
+// TestUploadPackage_uploadFile_MultiPart tests uploading a file with multiple parts.
+func TestUploadPackage_uploadFile_MultiPart(t *testing.T) {
 	server := newMockDropzoneServer()
 	defer server.Close()
 
-	client := NewDropzoneClient(server.Server.URL, server.dropzoneID)
-	pkg, err := client.CreatePackage()
+	client := newdropzoneClient(server.Server.URL, server.dropzoneID)
+	pkg, err := client.createPackage()
 	if err != nil {
-		t.Fatalf("CreatePackage failed: %v", err)
+		t.Fatalf("createPackage failed: %v", err)
 	}
 
-	// Create test data larger than FirstSegmentSize to trigger multiple parts
-	testData := bytes.Repeat([]byte("X"), FirstSegmentSize+1000)
-	reader := bytes.NewReader(testData)
+	// Create a temp file larger than segmentSize to trigger multiple parts
+	tmpDir, err := os.MkdirTemp("", "upload-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
 
-	var progressCalls []UploadProgress
-	fileID, err := pkg.AddFile("large.bin", reader, int64(len(testData)), func(p UploadProgress) {
-		progressCalls = append(progressCalls, p)
+	testData := bytes.Repeat([]byte("X"), segmentSize+1000)
+	testPath := filepath.Join(tmpDir, "large.bin")
+	if err := os.WriteFile(testPath, testData, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	var progressCalls int
+	fileID, err := pkg.uploadFile(testPath, func(bytes, total int64) {
+		progressCalls++
 	})
 	if err != nil {
-		t.Fatalf("AddFile failed: %v", err)
+		t.Fatalf("uploadFile failed: %v", err)
 	}
 
-	if len(progressCalls) != 2 {
-		t.Errorf("Progress called %d times, want 2", len(progressCalls))
+	if progressCalls < 1 {
+		t.Errorf("Progress called %d times, want at least 1", progressCalls)
 	}
 
 	// Verify both parts were uploaded
@@ -448,13 +494,13 @@ func TestUploadPackage_AddFile_MultiPart(t *testing.T) {
 	}
 
 	// Verify first part decrypts correctly
-	passphrase := pkg.ServerSecret + pkg.KeyCode
+	passphrase := pkg.serverSecret + pkg.keyCode
 	md, _ := openpgp.ReadMessage(bytes.NewReader(server.uploadedData[fileID+":1"]), nil, func(keys []openpgp.Key, symmetric bool) ([]byte, error) {
 		return []byte(passphrase), nil
 	}, nil)
 	decrypted, _ := io.ReadAll(md.UnverifiedBody)
-	if len(decrypted) != FirstSegmentSize {
-		t.Errorf("First part size = %d, want %d", len(decrypted), FirstSegmentSize)
+	if len(decrypted) != segmentSize {
+		t.Errorf("First part size = %d, want %d", len(decrypted), segmentSize)
 	}
 
 	// Verify second part decrypts correctly
@@ -467,62 +513,39 @@ func TestUploadPackage_AddFile_MultiPart(t *testing.T) {
 	}
 }
 
-// TestUploadPackage_AddFilePath tests uploading from a file path.
-func TestUploadPackage_AddFilePath(t *testing.T) {
+// TestUploadPackage_Finalize tests finalizing a package.
+func TestUploadPackage_Finalize(t *testing.T) {
 	server := newMockDropzoneServer()
 	defer server.Close()
 
-	client := NewDropzoneClient(server.Server.URL, server.dropzoneID)
-	pkg, err := client.CreatePackage()
+	client := newdropzoneClient(server.Server.URL, server.dropzoneID)
+	pkg, err := client.createPackage()
 	if err != nil {
-		t.Fatalf("CreatePackage failed: %v", err)
+		t.Fatalf("createPackage failed: %v", err)
 	}
 
-	// Create a temp file
+	// Add a file first
 	tmpDir, err := os.MkdirTemp("", "upload-test-*")
 	if err != nil {
 		t.Fatalf("MkdirTemp failed: %v", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	testContent := []byte("Test file content from disk.")
-	testPath := filepath.Join(tmpDir, "upload-test.txt")
-	if err := os.WriteFile(testPath, testContent, 0644); err != nil {
+	testData := []byte("Test content")
+	testPath := filepath.Join(tmpDir, "test.txt")
+	if err := os.WriteFile(testPath, testData, 0644); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	fileID, err := pkg.AddFilePath(testPath, nil)
+	_, err = pkg.uploadFile(testPath, nil)
 	if err != nil {
-		t.Fatalf("AddFilePath failed: %v", err)
-	}
-
-	if fileID == "" {
-		t.Error("FileID should not be empty")
-	}
-}
-
-// TestUploadPackage_Finalize tests finalizing a package.
-func TestUploadPackage_Finalize(t *testing.T) {
-	server := newMockDropzoneServer()
-	defer server.Close()
-
-	client := NewDropzoneClient(server.Server.URL, server.dropzoneID)
-	pkg, err := client.CreatePackage()
-	if err != nil {
-		t.Fatalf("CreatePackage failed: %v", err)
-	}
-
-	// Add a file first
-	testData := []byte("Test content")
-	_, err = pkg.AddFile("test.txt", bytes.NewReader(testData), int64(len(testData)), nil)
-	if err != nil {
-		t.Fatalf("AddFile failed: %v", err)
+		t.Fatalf("uploadFile failed: %v", err)
 	}
 
 	// Finalize
-	link, err := pkg.Finalize("test@example.com")
+	link, err := pkg.finalize("test@example.com")
 	if err != nil {
-		t.Fatalf("Finalize failed: %v", err)
+		t.Fatalf("finalize failed: %v", err)
 	}
 
 	if link == "" {
@@ -538,7 +561,7 @@ func TestUploadPackage_Finalize(t *testing.T) {
 	}
 
 	// Verify package was finalized on server
-	mockPkg := server.packages[pkg.PackageID]
+	mockPkg := server.packages[pkg.packageID]
 	if !mockPkg.finalized {
 		t.Error("Package should be marked as finalized")
 	}
@@ -549,15 +572,15 @@ func TestUploadPackage_SubmitHostedDropzone(t *testing.T) {
 	server := newMockDropzoneServer()
 	defer server.Close()
 
-	client := NewDropzoneClient(server.Server.URL, server.dropzoneID)
-	pkg, err := client.CreatePackage()
+	client := newdropzoneClient(server.Server.URL, server.dropzoneID)
+	pkg, err := client.createPackage()
 	if err != nil {
-		t.Fatalf("CreatePackage failed: %v", err)
+		t.Fatalf("createPackage failed: %v", err)
 	}
 
-	err = pkg.SubmitHostedDropzone("test@example.com", "TICKET-123")
+	err = pkg.submitHostedDropzone("https://example.com/secure/link", "test@example.com", "TICKET-123")
 	if err != nil {
-		t.Fatalf("SubmitHostedDropzone failed: %v", err)
+		t.Fatalf("submitHostedDropzone failed: %v", err)
 	}
 }
 
@@ -566,8 +589,8 @@ func TestDropzoneClient_InvalidDropzoneID(t *testing.T) {
 	server := newMockDropzoneServer()
 	defer server.Close()
 
-	client := NewDropzoneClient(server.Server.URL, "invalid-dropzone-id")
-	_, err := client.CreatePackage()
+	client := newdropzoneClient(server.Server.URL, "invalid-dropzone-id")
+	_, err := client.createPackage()
 	if err == nil {
 		t.Fatal("Expected error for invalid dropzone ID")
 	}

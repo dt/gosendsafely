@@ -1,4 +1,4 @@
-package ss
+package ziputil
 
 import (
 	"archive/zip"
@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/dt/gosendsafely/stream"
+	"github.com/dt/gosendsafely/util"
 )
 
 // createTestZip creates a ZIP file in memory and returns its bytes.
@@ -34,31 +37,36 @@ func createTestZip(t *testing.T, files map[string][]byte) []byte {
 }
 
 // createChunkedFileFromBytes creates a ChunkedFile from raw bytes.
-func createChunkedFileFromBytes(data []byte) *ChunkedFile[int] {
+func createChunkedFileFromBytes(data []byte) *stream.ChunkedFile[int] {
 	// Split into chunks of 1KB for testing
 	const chunkSize = 1024
 	numChunks := (len(data) + chunkSize - 1) / chunkSize
-	chunks := make([]Chunk[int], numChunks)
-	offset := 0
 
-	for i := 0; offset < len(data); i++ {
+	// Create chunk IDs
+	chunkIDs := make([]int, numChunks)
+	for i := range chunkIDs {
+		chunkIDs[i] = i
+	}
+
+	// Prefetch all chunks
+	prefetched := make(map[int][]byte)
+	offset := 0
+	for i := 0; i < numChunks && offset < len(data); i++ {
 		length := min(chunkSize, len(data)-offset)
-		chunks[i].ID = i
-		chunks[i].Idx = i
-		chunks[i].span = span{offset: offset, length: length}
-		chunks[i].ref()
-		chunks[i].setContent(data[offset : offset+length])
+		prefetched[i] = data[offset : offset+length]
 		offset += length
 	}
 
-	return &ChunkedFile[int]{
-		name:   "test.zip",
-		size:   len(data),
-		chunks: chunks,
-		fetcher: func(id int) ([]byte, error) {
+	return stream.NewChunkedFile(
+		"test.zip",
+		len(data),
+		chunkIDs,
+		chunkSize,
+		func(id int) ([]byte, error) {
 			return nil, nil // Not used since all chunks are pre-loaded
 		},
-	}
+		prefetched,
+	)
 }
 
 // TestDecodeIndex_SimpleZip tests decoding a simple ZIP file index.
@@ -430,7 +438,7 @@ func TestExtract_Progress(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	var progressCalls int
-	_, _, err = Extract(cf, index, tmpDir, nil, func(frac float64, rate BytesSize) {
+	_, _, err = Extract(cf, index, tmpDir, nil, func(frac float64, rate util.BytesSize) {
 		progressCalls++
 	})
 	if err != nil {

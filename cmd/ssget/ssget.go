@@ -6,7 +6,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/dt/gosendsafely/ss"
+	"github.com/dt/gosendsafely/sendsafely"
+	"github.com/dt/gosendsafely/util"
 	"github.com/spf13/cobra"
 )
 
@@ -43,7 +44,7 @@ Patterns use glob matching (e.g., "*.zip", "debug-*.tar.gz").`,
 func run(cmd *cobra.Command, args []string) error {
 	// Handle --forget-keyring
 	if forgetKeyring {
-		if err := ss.ForgetCredentials(); err != nil {
+		if err := sendsafely.ForgetCredentials(); err != nil {
 			return err
 		}
 		fmt.Fprintln(os.Stderr, "Credentials removed from system keychain.")
@@ -59,8 +60,8 @@ func run(cmd *cobra.Command, args []string) error {
 	rawURL := args[0]
 	patterns := args[1:]
 
-	credOpts := ss.CredentialOptions{NoKeyring: noKeyring}
-	pkg, err := ss.OpenPackage(rawURL, ss.Limiter(16), credOpts)
+	credOpts := sendsafely.CredentialOptions{NoKeyring: noKeyring}
+	pkg, err := sendsafely.OpenPackage(rawURL, util.Limiter(32), credOpts)
 	if err != nil {
 		return err
 	}
@@ -79,7 +80,7 @@ func run(cmd *cobra.Command, args []string) error {
 	// List mode
 	if listOnly {
 		for _, f := range files {
-			fmt.Printf("%s\t%s\n", f.Name, ss.BytesSize(f.Size))
+			fmt.Printf("%s\t%s\n", f.Name, util.BytesSize(f.Size))
 		}
 		return nil
 	}
@@ -93,31 +94,32 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 		if s, err := os.Stat(outPath); err == nil {
 			if s.Size() == int64(f.Size) {
-				fmt.Printf("%s (%s) already exists\n", outPath, ss.BytesSize(s.Size()))
+				fmt.Printf("%s (%s) already exists\n", outPath, util.BytesSize(s.Size()))
 			} else {
 				fmt.Printf("%s (%s) already exists, but differs from remote size (%s) by %s\n",
-					outPath, ss.BytesSize(s.Size()), f.Size, f.Size-ss.BytesSize(s.Size()))
+					outPath, util.BytesSize(s.Size()), f.Size, f.Size-util.BytesSize(s.Size()))
 			}
 			continue
 		}
 		before := time.Now()
+		fmt.Printf("%s (%s)...\n", f.Name, util.BytesSize(f.Size))
 		if err := pkg.DownloadFile(f.Name, outPath, func(stage string, bps int, frac float64) {
 			if frac == 0 {
-				fmt.Printf("\r%s (%s):  %18s", f.Name, ss.BytesSize(f.Size), stage)
+				fmt.Printf("\r\t%s", stage)
 			} else {
-				fmt.Printf("\r%s (%s):  %18s\t%5s/s   %.1f%%    ", f.Name, ss.BytesSize(f.Size), stage, ss.BytesSize(bps), frac*100)
+				fmt.Printf("\r\t%5s/s   %.1f%%  ", util.BytesSize(bps), frac*100)
 			}
 		}); err != nil {
-			return fmt.Errorf("failed to download %s: %w", f.Name, err)
+			return fmt.Errorf("\nfailed to download %s: %w", f.Name, err)
 		}
-		dur := time.Since(before) 
-		fmt.Printf("\r%s:  %18s %5s    %5s/s%10s\n", outPath, "", ss.ConciseDuration(dur), ss.BytesSize(int(float64(f.Size)/dur.Seconds())), "")
+		dur := time.Since(before)
+		fmt.Printf("\r%s:  %18s %5s    %5s/s%10s\n", outPath, "", util.ConciseDuration(dur), util.BytesSize(int(float64(f.Size)/dur.Seconds())), "")
 	}
 	return nil
 }
 
-func filterFiles(files []ss.FileInfo, patterns []string) []ss.FileInfo {
-	var result []ss.FileInfo
+func filterFiles(files []sendsafely.FileInfo, patterns []string) []sendsafely.FileInfo {
+	var result []sendsafely.FileInfo
 	for _, f := range files {
 		for _, p := range patterns {
 			if matched, _ := filepath.Match(p, f.Name); matched {

@@ -111,9 +111,15 @@ API credentials are loaded from (in order):
 
 ## Design
 
-The `ss` library implements a streaming architecture optimized for large encrypted archives:
+The implementation uses a streaming architecture optimized for large encrypted archives, organized into focused packages:
 
-**Chunked File Abstraction:** SendSafely files are stored as PGP-encrypted chunks. The `ChunkedFile` type presents these chunks as a seekable byte stream, fetching and decrypting chunks on demand.
+**Package Structure:**
+- `stream/` - Chunked file abstraction for seekable streaming of chunked content
+- `ziputil/` - ZIP archive processing (index decoding, selective extraction, recovery) for archives stored in chunked files.
+- `util/` - Shared utilities (byte size formatting, concurrency limits)
+- `sendsafely/` - SendSafely API client (package downloads, dropzone uploads, authentication)
+
+**Chunked File Abstraction (`stream/`):** SendSafely files are stored as PGP-encrypted chunks. The `ChunkedFile` type presents seekable byte stream backed by fetching and decrypting remote chunks on demand.
 
 **Parallel Pipeline:** Downloads run as a producer-consumer pipeline:
 - A pool of fetcher goroutines downloads and decrypts chunks concurrently (up to 16 parallel requests)
@@ -124,7 +130,7 @@ The `ss` library implements a streaming architecture optimized for large encrypt
 
 **Blocking Reads:** When a reader needs data from a chunk still being fetched, it blocks on a ready channel until the chunk content is available. This allows extraction to proceed as fast as chunks arrive without explicit coordination.
 
-**Streaming Selective ZIP Processing:** For `ssunzip`, the ZIP central directory (CD) is read first from the end of the file to decode the index. Each selected file's compressed data is then read directly from its offset in the archive, decompressed, and written to disk—all in parallel with chunk downloading. This works because the CD provides file offsets, enabling selective access without downloading the entire archive.
+**Streaming Selective ZIP Processing (`ziputil/`):** For `ssunzip`, the ZIP central directory (CD) is read first from the end of the file to decode the index. Each selected file's compressed data is then read directly from its offset in the archive, decompressed, and written to disk—all in parallel with chunk downloading. This works because the CD provides file offsets, enabling selective access without downloading the entire archive.
 
 **Truncated ZIP Recovery:** If the file is slightly truncated (missing the EOCD marker and some suffix of the CD), recovery mode scans backward from EOF to find any CD entries that remain intact. Files with valid CD entries can still be extracted; entries in the truncated portion are lost (even though their content is in the data portion of the zip).
 

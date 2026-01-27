@@ -1,4 +1,4 @@
-package ss
+package util
 
 import (
 	"fmt"

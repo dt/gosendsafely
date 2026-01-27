@@ -1,7 +1,8 @@
-package ss
+package sendsafely
 
 import (
 	"bytes"
+	"crypto/pbkdf2"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"crypto/pbkdf2"
+	"github.com/dt/gosendsafely/util"
 )
 
 // mockSendSafelyServer creates a test server that simulates the SendSafely API.
@@ -215,7 +216,7 @@ func (m *mockSendSafelyServer) handleDownload(w http.ResponseWriter, r *http.Req
 
 	// Encrypt the chunk data with PGP
 	passphrase := pkg.serverSecret + pkg.keyCode
-	encrypted, err := EncryptPGP(file.chunks[chunkIndex], passphrase)
+	encrypted, err := encryptPGP(file.chunks[chunkIndex], passphrase)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -258,7 +259,7 @@ func TestOpenPackage_Success(t *testing.T) {
 
 	url := fmt.Sprintf("%s/receive/?packageCode=%s#keyCode=%s", server.Server.URL, pkg.packageCode, pkg.keyCode)
 
-	result, err := OpenPackage(url, Limiter(4), CredentialOptions{NoKeyring: true})
+	result, err := OpenPackage(url, util.Limiter(4), CredentialOptions{NoKeyring: true})
 	if err != nil {
 		t.Fatalf("OpenPackage failed: %v", err)
 	}
@@ -399,7 +400,7 @@ func TestOpenPackage_URLVariants(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := OpenPackage(tc.url, Limiter(4), CredentialOptions{NoKeyring: true})
+			result, err := OpenPackage(tc.url, util.Limiter(4), CredentialOptions{NoKeyring: true})
 			if err != nil {
 				t.Fatalf("OpenPackage failed for %s: %v", tc.name, err)
 			}
@@ -434,7 +435,7 @@ func TestPackage_Open(t *testing.T) {
 
 	url := fmt.Sprintf("%s/receive/?packageCode=%s#keyCode=%s", server.Server.URL, pkg.packageCode, pkg.keyCode)
 
-	result, err := OpenPackage(url, Limiter(4), CredentialOptions{NoKeyring: true})
+	result, err := OpenPackage(url, util.Limiter(4), CredentialOptions{NoKeyring: true})
 	if err != nil {
 		t.Fatalf("OpenPackage failed: %v", err)
 	}
@@ -475,7 +476,7 @@ func TestPackage_Open_FileNotFound(t *testing.T) {
 
 	url := fmt.Sprintf("%s/receive/?packageCode=%s#keyCode=%s", server.Server.URL, pkg.packageCode, pkg.keyCode)
 
-	result, err := OpenPackage(url, Limiter(4), CredentialOptions{NoKeyring: true})
+	result, err := OpenPackage(url, util.Limiter(4), CredentialOptions{NoKeyring: true})
 	if err != nil {
 		t.Fatalf("OpenPackage failed: %v", err)
 	}
@@ -787,7 +788,7 @@ func TestOpenPackage_EscapedURL(t *testing.T) {
 	// URL with backslash escapes (as might be pasted from iTerm2)
 	escapedURL := fmt.Sprintf("%s/receive/\\?packageCode\\=%s\\#keyCode\\=%s", server.Server.URL, pkg.packageCode, pkg.keyCode)
 
-	result, err := OpenPackage(escapedURL, Limiter(4), CredentialOptions{NoKeyring: true})
+	result, err := OpenPackage(escapedURL, util.Limiter(4), CredentialOptions{NoKeyring: true})
 	if err != nil {
 		t.Fatalf("OpenPackage failed for escaped URL: %v", err)
 	}

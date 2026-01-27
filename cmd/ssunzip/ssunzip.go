@@ -6,7 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dt/gosendsafely/ss"
+	"github.com/dt/gosendsafely/sendsafely"
+	"github.com/dt/gosendsafely/util"
+	"github.com/dt/gosendsafely/ziputil"
 	"github.com/spf13/cobra"
 )
 
@@ -21,7 +23,7 @@ var (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "ssunzip <sendsafely-url> [file-patterns...]",
+		Use: "ssunzip <sendsafely-url> [file-patterns...]",
 		Long: `Extract files from a ZIP stored in a SendSafely package.
 
 If no file patterns are specified, all files are extracted.
@@ -46,7 +48,7 @@ Patterns use glob matching (e.g., "*.json", "debug/nodes/*/logs/*").`,
 func run(cmd *cobra.Command, args []string) error {
 	// Handle --forget-keyring
 	if forgetKeyring {
-		if err := ss.ForgetCredentials(); err != nil {
+		if err := sendsafely.ForgetCredentials(); err != nil {
 			return err
 		}
 		fmt.Fprintln(os.Stderr, "Credentials removed from system keychain.")
@@ -61,10 +63,10 @@ func run(cmd *cobra.Command, args []string) error {
 
 	rawURL := args[0]
 	patterns := args[1:]
-	lim := ss.Limiter(16)
+	lim := util.Limiter(32)
 
-	credOpts := ss.CredentialOptions{NoKeyring: noKeyring}
-	pkg, err := ss.OpenPackage(rawURL, lim, credOpts)
+	credOpts := sendsafely.CredentialOptions{NoKeyring: noKeyring}
+	pkg, err := sendsafely.OpenPackage(rawURL, lim, credOpts)
 	if err != nil {
 		return err
 	}
@@ -91,10 +93,10 @@ func run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open ZIP: %w", err)
 	}
-	fmt.Printf("ZIP file size: %s\n", ss.BytesSize(zip.Size()))
+	fmt.Printf("ZIP file size: %s\n", util.BytesSize(zip.Size()))
 
 	// Get index of files in ZIP
-	index, err := ss.DecodeIndex(zip)
+	index, err := ziputil.DecodeIndex(zip)
 	if err != nil {
 		return fmt.Errorf("failed to parse ZIP index: %w", err)
 	}
@@ -115,7 +117,7 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	filteredSize, filteredCount := 0, 0
-	var filteredCompressedSize  ss.BytesSize
+	var filteredCompressedSize util.BytesSize
 	for _, e := range index {
 		filteredSize += int(e.Size)
 		filteredCompressedSize += e.CompressedSize()
@@ -127,7 +129,6 @@ func run(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-
 	// List mode
 	if listOnly {
 		if len(patterns) > 0 || len(excludes) > 0 {
@@ -136,9 +137,9 @@ func run(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Content:\n")
 		}
 		for _, e := range index {
-			fmt.Printf("%s\t%s\t(%s compressed)\n", e.Name, ss.BytesSize(e.Size), ss.BytesSize(int64(e.CompressedSize())))
+			fmt.Printf("%s\t%s\t(%s compressed)\n", e.Name, util.BytesSize(e.Size), util.BytesSize(int64(e.CompressedSize())))
 		}
-		fmt.Printf("Total: %d files\t%s\t(%s compressed)\n", filteredCount, ss.BytesSize(int64(filteredSize)), ss.BytesSize(int64(filteredCompressedSize)))
+		fmt.Printf("Total: %d files\t%s\t(%s compressed)\n", filteredCount, util.BytesSize(int64(filteredSize)), util.BytesSize(int64(filteredCompressedSize)))
 		return nil
 	}
 
@@ -147,29 +148,29 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	fmt.Printf("Downloading and extracting %d files to %s...", filteredCount, outDir)
+	fmt.Printf("Fetching and extracting %d files to %s...\n", filteredCount, outDir)
 	before := time.Now()
-	skipped, skippedBytes, err := ss.Extract(zip, index, outDir, lim, func(frac float64, rate ss.BytesSize) {
-		fmt.Printf("\rDownloading and extracting %d files to %s...   %0.1f%%     (%s/s) %5s", filteredCount, outDir, frac*100, rate, "")
+	skipped, skippedBytes, err := ziputil.Extract(zip, index, outDir, lim, func(frac float64, rate util.BytesSize) {
+		fmt.Printf("\r%0.1f%%     (%s/s)   ", frac*100, rate)
 	})
 	if err != nil {
-		return fmt.Errorf("extraction failed: %w", err)
-	}	
+		return fmt.Errorf("\nextraction failed: %w", err)
+	}
 	dur := time.Since(before)
-	rate := ss.BytesSize(float64(filteredCompressedSize - skippedBytes) / dur.Seconds())
+	rate := util.BytesSize(float64(filteredCompressedSize-skippedBytes) / dur.Seconds())
 
 	if skipped > 0 {
-		fmt.Printf("\rDownloaded and extracted %d files / %s  to %s (%d  / %s already existed) in %s (%s/s) %10s\n", 
-			filteredCount-skipped, ss.BytesSize(filteredSize-int(skippedBytes)), outDir, skipped, ss.BytesSize(int64(skippedBytes)), ss.ConciseDuration(dur), rate, "")
+		fmt.Printf("\rFetched %d files / %s  to %s (%d  / %s already existed) in %s (%s/s) %10s\n",
+			filteredCount-skipped, util.BytesSize(filteredSize-int(skippedBytes)), outDir, skipped, util.BytesSize(int64(skippedBytes)), util.ConciseDuration(dur), rate, "")
 	} else {
-		fmt.Printf("\rDownloaded and extracted %d files / %s  to %s in %s (%s/s)%30s\n", 
-			filteredCount, ss.BytesSize(filteredSize), outDir, ss.ConciseDuration(dur), rate, "")
+		fmt.Printf("\rFetched %d files / %s  to %s in %s (%s/s)%30s\n",
+			filteredCount, util.BytesSize(filteredSize), outDir, util.ConciseDuration(dur), rate, "")
 	}
 	return nil
-	
+
 }
 
-func findZipFile(pkg *ss.Package) (string, error) {
+func findZipFile(pkg *sendsafely.Package) (string, error) {
 	files := pkg.Files()
 	var zips []string
 	for _, f := range files {
