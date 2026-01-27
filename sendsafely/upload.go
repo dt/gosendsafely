@@ -3,6 +3,8 @@ package sendsafely
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -159,21 +161,10 @@ func (c *dropzoneClient) createPackage() (*uploadPackage, error) {
 
 func generateKeyCode() (string, error) {
 	b := make([]byte, 32)
-	f, err := os.Open("/dev/urandom")
-	if err != nil {
+	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	defer f.Close()
-	if _, err := io.ReadFull(f, b); err != nil {
-		return "", err
-	}
-	const hexChars = "0123456789abcdef"
-	result := make([]byte, 64)
-	for i, v := range b {
-		result[i*2] = hexChars[v>>4]
-		result[i*2+1] = hexChars[v&0x0f]
-	}
-	return string(result), nil
+	return hex.EncodeToString(b), nil
 }
 
 // uploadChunk represents work for a single chunk upload.

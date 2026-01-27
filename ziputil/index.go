@@ -1,3 +1,5 @@
+// Package ziputil provides ZIP file parsing and extraction.
+// Note: This package requires a 64-bit system for correct handling of large files.
 package ziputil
 
 import (

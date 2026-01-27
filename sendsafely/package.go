@@ -375,6 +375,7 @@ func (p *Package) DownloadFile(fileName, outputPath string, progress func(string
 			return err
 		}
 	}
+	defer f.Close()
 
 	// Create reader starting at the resume offset
 	reader := file.Reader(resumeOffset, file.Size()-resumeOffset)
@@ -419,14 +420,6 @@ func (p *Package) DownloadFile(fileName, outputPath string, progress func(string
 	})
 
 	if err := g.Wait(); err != nil {
-		return err
-	}
-
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-
-	if err != nil {
 		os.Remove(tmpPath)
 		return err
 	}

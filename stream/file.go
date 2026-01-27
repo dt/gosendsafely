@@ -36,7 +36,9 @@ type ChunkedFile[T any] struct {
 	size    int
 	chunks  []chunk[T]
 	fetcher func(id T) ([]byte, error)
-	pinning bool // If true, chunks are double-ref'd to pin them in memory
+	// pinning enables double-ref mode for readers. Only modified during the
+	// single-threaded reader-opening phase, before FetchChunks runs.
+	pinning bool
 }
 
 // NewChunkedFile creates a chunked file from chunk IDs.

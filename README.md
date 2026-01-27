@@ -99,7 +99,7 @@ The script auto-selects from `~/bin`, `~/.local/bin`, or `/usr/local/bin` based 
 ```bash
 go install github.com/dt/gosendsafely/cmd/...@latest
 ```
-NB: requires Go 1.25+.
+Requires Go 1.23+ and a 64-bit system.
 
 ## Credentials
 

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -33,12 +34,17 @@ func Extract[T any](
 
 	var totalSize int
 	var existingSize, existingFiles util.BytesSize
+	cleanDest := filepath.Clean(dest) + string(os.PathSeparator)
 	for _, i := range index {
 		totalSize += int(i.CompressedSize())
 		// Expand range to include local file header (30 bytes + filename + extra field)
 		headerEstimate := 30 + len(i.Name) + 256
 		expandedSpan := span{offset: i.src.offset, length: i.src.length + headerEstimate}
 		out := filepath.Join(dest, i.Name)
+		// Prevent path traversal attacks (zip slip)
+		if !strings.HasPrefix(filepath.Clean(out)+string(os.PathSeparator), cleanDest) {
+			return 0, 0, fmt.Errorf("path traversal detected: %s", i.Name)
+		}
 		if s, err := os.Stat(out); err == nil && s.Size() == int64(i.Size) {
 			// File already exists with correct size, skip extraction
 			existingFiles++
@@ -145,9 +151,11 @@ func (e *extraction) write() error {
 	}()
 
 	// Copy the file data, decompressing if needed, to the output file.
+	// Note: e.src is already span-limited, but we limit stored copies as a
+	// defensive measure since deflate relies on the stream format for length.
 	switch e.compression {
 	case 0: // Stored
-		_, err = io.Copy(f, e.src)
+		_, err = io.CopyN(f, e.src, e.srcSize)
 	case 8: // Deflate
 		ex := flate.NewReader(e.src)
 		defer ex.Close()

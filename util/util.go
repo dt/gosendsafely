@@ -15,6 +15,8 @@ func Limiter(n int) Sem {
 	return make(Sem, n)
 }
 
+// Acquire blocks until a slot is available or the context is cancelled.
+// Callers should check ctx.Err() if they need to distinguish between the two.
 func (l Sem) Acquire(ctx context.Context) {
 	if l != nil {
 		select {
