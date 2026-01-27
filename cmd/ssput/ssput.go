@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/dt/ssdownload/ss"
+	"github.com/dt/gosendsafely/ss"
 	"github.com/spf13/cobra"
 )
 

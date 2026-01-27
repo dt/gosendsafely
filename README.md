@@ -80,24 +80,24 @@ ssget -l "https://sendsafely.example.com/receive/?packageCode=ABC123#keyCode=xyz
 
 **Install Pre-built binaries:**
 
-Pre-built binaries for macOS and Linux are available on [GitHub Releases](https://github.com/dt/ssunzip/releases).
+Pre-built binaries for macOS and Linux are available on [GitHub Releases](https://github.com/dt/gosendsafely/releases).
 
 Download the applicable binary to a folder in `PATH`, or use the automatic install script to do so:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dt/ssunzip/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/dt/gosendsafely/main/install.sh | sh
 ```
 
 To specify an install directory:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dt/ssunzip/main/install.sh | INSTALL_DIR=~/.local/bin sh
+curl -fsSL https://raw.githubusercontent.com/dt/gosendsafely/main/install.sh | INSTALL_DIR=~/.local/bin sh
 ```
 
 The script auto-selects from `~/bin`, `~/.local/bin`, or `/usr/local/bin` based on which is first in PATH. Falls back to current directory if none are available.
 
 **Build and install from source:**
 ```bash
-go install github.com/dt/ssunzip/cmd/...@latest
+go install github.com/dt/gosendsafely/cmd/...@latest
 ```
 NB: requires Go 1.25+.
 

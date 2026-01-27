@@ -1,4 +1,4 @@
-module github.com/dt/ssdownload
+module github.com/dt/gosendsafely
 
 go 1.25.1
 
