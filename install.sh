@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="dt/ssunzip"
+REPO="dt/gosendsafely"
 
 # Use INSTALL_DIR if set, otherwise pick first candidate directory that exists and is in PATH
 if [ -z "$INSTALL_DIR" ]; then
