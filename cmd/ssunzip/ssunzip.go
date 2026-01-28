@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var version = "dev"
+
 var (
 	outDir        string
 	zipFile       string
@@ -23,7 +25,8 @@ var (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use: "ssunzip <sendsafely-url> [file-patterns...]",
+		Use:     "ssunzip <sendsafely-url> [file-patterns...]",
+		Version: version,
 		Long: `Extract files from a ZIP stored in a SendSafely package.
 
 If no file patterns are specified, all files are extracted.
@@ -60,6 +63,8 @@ func run(cmd *cobra.Command, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("sendsafely-url is required")
 	}
+
+	defer util.CheckForLatestVersion("ssunzip", version)()
 
 	rawURL := args[0]
 	patterns := args[1:]

@@ -16,14 +16,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Vet ssget
-        run: go vet ./cmd/ssget
-
-      - name: Vet ssunzip
-        run: go vet ./cmd/ssunzip
-
-      - name: Vet ss package
-        run: go vet ./ss
+      - name: Vet
+        run: go vet ./...
 
   test:
     runs-on: ubuntu-latest

@@ -28,8 +28,9 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
-          go build -o ssget-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/ssget
-          go build -o ssunzip-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/ssunzip
+          LDFLAGS="-X main.version=${{ github.ref_name }}"
+          go build -ldflags "$LDFLAGS" -o ssget-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/ssget
+          go build -ldflags "$LDFLAGS" -o ssunzip-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/ssunzip
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4

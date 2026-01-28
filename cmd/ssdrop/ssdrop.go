@@ -11,6 +11,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var version = "dev"
+
 var (
 	dropzoneURL string
 	dropzoneID  string
@@ -20,8 +22,9 @@ var (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "ssdrop [flags] FILE [FILE...]",
-		Short: "Upload files to a SendSafely dropzone",
+		Use:     "ssdrop [flags] FILE [FILE...]",
+		Version: version,
+		Short:   "Upload files to a SendSafely dropzone",
 		Long: `Upload files to a SendSafely dropzone.
 
 This tool uploads files to SendSafely dropzones (anonymous upload portals).
@@ -55,6 +58,8 @@ Example:
 }
 
 func run(cmd *cobra.Command, files []string) error {
+	defer util.CheckForLatestVersion("ssdrop", version)()
+
 	// Validate files exist and calculate total size
 	var totalSize int64
 	for _, f := range files {
@@ -93,7 +98,7 @@ func run(cmd *cobra.Command, files []string) error {
 	fmt.Fprintf(os.Stderr, "\r%80s\r", "") // blank out last progress line
 
 	fmt.Fprintf(os.Stderr, "Uploaded %d files (%s)\t %s (%s/s)\n",
-		len(files),util.BytesSize(totalSize), util.ConciseDuration(dur), util.BytesSize(float64(totalSize) / dur.Seconds()))
+		len(files), util.BytesSize(totalSize), util.ConciseDuration(dur), util.BytesSize(float64(totalSize)/dur.Seconds()))
 
 	fmt.Println(link)
 	return nil

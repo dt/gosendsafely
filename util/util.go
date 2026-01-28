@@ -2,8 +2,12 @@ package util
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -66,4 +70,59 @@ func (d ConciseDuration) Format(f fmt.State, c rune) {
 		return
 	}
 	fmt.Fprintf(f, "%dh%dm", m/60, m%60)
+}
+
+const releaseURL = "https://api.github.com/repos/dt/gosendsafely/releases/latest"
+
+// CheckForLatestVersion starts a background check for newer versions.
+// Returns a function that should be deferred/run when main would exit that
+// cancels the check if still running or prints a notice if a newer version was
+// found.
+func CheckForLatestVersion(tool, currentVersion string) func() {
+	// Skip check for dev builds
+	if currentVersion == "dev" || currentVersion == "" {
+		return func() {}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	result := make(chan string, 1)
+
+	go func() {
+		defer close(result)
+
+		req, err := http.NewRequestWithContext(ctx, "GET", releaseURL, nil)
+		if err != nil {
+			return
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != 200 {
+			return
+		}
+		defer resp.Body.Close()
+
+		var release struct {
+			TagName string `json:"tag_name"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+			return
+		}
+
+		latest := strings.TrimPrefix(release.TagName, "v")
+		current := strings.TrimPrefix(currentVersion, "v")
+		if latest != current {
+			result <- fmt.Sprintf("\n%s: version %s is available (current: %s)", tool, release.TagName, currentVersion)
+		}
+	}()
+
+	return func() {
+		cancel()
+		select {
+		case msg := <-result:
+			if msg != "" {
+				fmt.Fprintln(os.Stderr, msg)
+			}
+		default:
+		}
+	}
 }

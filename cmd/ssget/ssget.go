@@ -11,6 +11,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var version = "dev"
+
 var (
 	outDir        string
 	listOnly      bool
@@ -20,8 +22,9 @@ var (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "ssget <sendsafely-url> [file-patterns...]",
-		Short: "Download files from a SendSafely package",
+		Use:     "ssget <sendsafely-url> [file-patterns...]",
+		Version: version,
+		Short:   "Download files from a SendSafely package",
 		Long: `Download files from a SendSafely package.
 
 If no file patterns are specified, all files are downloaded.
@@ -56,6 +59,8 @@ func run(cmd *cobra.Command, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("sendsafely-url is required")
 	}
+
+	defer util.CheckForLatestVersion("ssget", version)()
 
 	rawURL := args[0]
 	patterns := args[1:]
