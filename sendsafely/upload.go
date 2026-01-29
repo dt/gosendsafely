@@ -33,6 +33,7 @@ const (
 func UploadToDropzone(
 	dropzoneURL, dropzoneID, email, label string,
 	progress func(name string, size util.BytesSize, mbps util.BytesSize, frac float64),
+	onComplete func(name string, size util.BytesSize, duration time.Duration),
 	paths ...string,
 ) (string, error) {
 	if len(paths) == 0 {
@@ -52,25 +53,28 @@ func UploadToDropzone(
 		}
 
 		name := filepath.Base(path)
+		size := util.BytesSize(info.Size())
+		fileStart := time.Now()
 		var lastUpdate time.Time
-		var lastBytes int64
 
 		_, err = pkg.uploadFile(path, func(bytes, total int64) {
 			if progress != nil {
 				now := time.Now()
-				elapsed := now.Sub(lastUpdate)
-				if elapsed > time.Second { 
-					bytesSinceLast := bytes - lastBytes
-					mbps := util.BytesSize(float64(bytesSinceLast) / elapsed.Seconds())
+				if now.Sub(lastUpdate) > time.Second {
+					elapsed := now.Sub(fileStart).Seconds()
+					mbps := util.BytesSize(float64(bytes) / elapsed)
 					frac := float64(bytes) / float64(total)
-					progress(name, util.BytesSize(info.Size()), mbps, frac)
+					progress(name, size, mbps, frac)
 					lastUpdate = now
-					lastBytes = bytes
 				}
 			}
 		})
 		if err != nil {
 			return "", fmt.Errorf("upload %s: %w", path, err)
+		}
+
+		if onComplete != nil {
+			onComplete(name, size, time.Since(fileStart))
 		}
 	}
 

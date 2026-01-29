@@ -88,6 +88,10 @@ func run(cmd *cobra.Command, files []string) error {
 		func(name string, size util.BytesSize, mbps util.BytesSize, frac float64) {
 			fmt.Fprintf(os.Stderr, "\r%-60s", fmt.Sprintf("%s (%s): %.1f%% (%s/s)", name, size, frac*100, mbps))
 		},
+		func(name string, size util.BytesSize, dur time.Duration) {
+			rate := util.BytesSize(float64(size) / dur.Seconds())
+			fmt.Fprintf(os.Stderr, "\r\t%s: %s in %s (%s/s)\n", name, size, util.ConciseDuration(dur), rate)
+		},
 		files...,
 	)
 	if err != nil {
