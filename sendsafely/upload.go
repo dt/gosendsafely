@@ -6,6 +6,7 @@ import (
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,9 +15,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/dt/gosendsafely/util"
 	"golang.org/x/sync/errgroup"
 )
@@ -78,18 +82,18 @@ func UploadToDropzone(
 		}
 	}
 
+	// Distribute keycodes to package recipients before finalizing.
+	_ = pkg.distributeKeycodes()
+
 	link, err := pkg.finalize(email)
 	if err != nil {
 		return "", fmt.Errorf("finalize: %w", err)
 	}
 
-	// Submit to hosted dropzone if label provided
-	if label != "" {
-		if err := pkg.submitHostedDropzone(link, email, label); err != nil {
-			// Don't fail the whole operation if dropzone submission fails
-			// The link is still valid
-			return link, fmt.Errorf("upload succeeded but dropzone submission failed: %w", err)
-		}
+	if err := pkg.submitHostedDropzone(link, email, label); err != nil {
+		// Don't fail the whole operation if dropzone submission fails
+		// The link is still valid
+		return link, fmt.Errorf("upload succeeded but dropzone submission failed: %w", err)
 	}
 
 	return link, nil
@@ -130,7 +134,8 @@ type uploadPackage struct {
 func (c *dropzoneClient) createPackage() (*uploadPackage, error) {
 	urlPath := "/drop-zone/v2.0/package/"
 
-	resp, err := c.doRequest("PUT", urlPath, nil)
+	createBody, _ := json.Marshal(map[string]interface{}{"vdr": false})
+	resp, err := c.doRequest("PUT", urlPath, createBody)
 	if err != nil {
 		return nil, fmt.Errorf("create package: %w", err)
 	}
@@ -174,7 +179,7 @@ func generateKeyCode() (string, error) {
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(b), nil
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 // uploadChunk represents work for a single chunk upload.
@@ -298,8 +303,11 @@ func (p *uploadPackage) finalize(email string) (secureLink string, err error) {
 	checksum := hex.EncodeToString(dk)
 
 	body := map[string]interface{}{
-		"checksum":          checksum,
-		"unconfirmedSender": email,
+		"checksum":              checksum,
+		"unconfirmedSender":     email,
+		"undisclosedRecipients": false,
+		"notifyRecipients":      false,
+		"readOnlyPdf":           false,
 	}
 	bodyBytes, _ := json.Marshal(body)
 
@@ -327,6 +335,120 @@ func (p *uploadPackage) finalize(email string) (secureLink string, err error) {
 	// Construct the full secure link: message contains base URL, append keyCode
 	secureLink = finResp.Message + "#keyCode=" + p.keyCode
 	return secureLink, nil
+}
+
+// recipientKey represents a recipient's public key from the package.
+type recipientKey struct {
+	ID  string `json:"id"`
+	Key string `json:"key"`
+}
+
+// distributeKeycodes fetches recipient public keys and uploads the keycode
+// encrypted for each recipient. This is required for recipients to access the
+// package — without it, only the uploader can decrypt.
+func (p *uploadPackage) distributeKeycodes() error {
+	publicKeys, err := p.getPublicKeys()
+	if err != nil {
+		return fmt.Errorf("get public keys: %w", err)
+	}
+
+	for _, pk := range publicKeys {
+		encryptedKeycode, err := p.encryptKeycodeForRecipient(pk.Key)
+		if err != nil {
+			return fmt.Errorf("encrypt keycode for recipient %s: %w", pk.ID, err)
+		}
+
+		if err := p.uploadKeycode(pk.ID, encryptedKeycode); err != nil {
+			return fmt.Errorf("upload keycode for recipient %s: %w", pk.ID, err)
+		}
+	}
+
+	return nil
+}
+
+// getPublicKeys fetches the public keys for all package recipients.
+func (p *uploadPackage) getPublicKeys() ([]recipientKey, error) {
+	urlPath := fmt.Sprintf("/drop-zone/v2.0/package/%s/public-keys/", p.packageCode)
+	resp, err := p.client.doRequest("GET", urlPath, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var keysResp struct {
+		Response   string         `json:"response"`
+		Message    string         `json:"message"`
+		PublicKeys []recipientKey `json:"publicKeys"`
+	}
+	if err := json.Unmarshal(resp, &keysResp); err != nil {
+		return nil, err
+	}
+
+	if keysResp.Response != "SUCCESS" {
+		return nil, fmt.Errorf("get public keys: %s - %s", keysResp.Response, keysResp.Message)
+	}
+
+	return keysResp.PublicKeys, nil
+}
+
+// encryptKeycodeForRecipient encrypts the keycode with a recipient's public key,
+// returning the armored PGP message.
+func (p *uploadPackage) encryptKeycodeForRecipient(armoredPublicKey string) (string, error) {
+	entityList, err := openpgp.ReadArmoredKeyRing(strings.NewReader(armoredPublicKey))
+	if err != nil {
+		return "", fmt.Errorf("parse public key: %w", err)
+	}
+
+	var buf bytes.Buffer
+	armorWriter, err := armor.Encode(&buf, "PGP MESSAGE", nil)
+	if err != nil {
+		return "", err
+	}
+
+	plaintext, err := openpgp.Encrypt(armorWriter, entityList, nil, nil, nil)
+	if err != nil {
+		return "", err
+	}
+	if _, err := plaintext.Write([]byte(p.keyCode)); err != nil {
+		return "", err
+	}
+	if err := plaintext.Close(); err != nil {
+		return "", err
+	}
+	if err := armorWriter.Close(); err != nil {
+		return "", err
+	}
+
+	return buf.String(), nil
+}
+
+// uploadKeycode uploads an encrypted keycode for a specific recipient.
+func (p *uploadPackage) uploadKeycode(publicKeyID, encryptedKeycode string) error {
+	urlPath := fmt.Sprintf("/drop-zone/v2.0/package/%s/link/%s/", p.packageCode, publicKeyID)
+
+	body := map[string]interface{}{
+		"keycode":          encryptedKeycode,
+		"notifyRecipients": false,
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	resp, err := p.client.doRequest("PUT", urlPath, bodyBytes)
+	if err != nil {
+		return err
+	}
+
+	var linkResp struct {
+		Response string `json:"response"`
+		Message  string `json:"message"`
+	}
+	if err := json.Unmarshal(resp, &linkResp); err != nil {
+		return err
+	}
+
+	if linkResp.Response != "SUCCESS" {
+		return fmt.Errorf("upload keycode: %s - %s", linkResp.Response, linkResp.Message)
+	}
+
+	return nil
 }
 
 // submitHostedDropzone submits to the dropzone webhook (for Zendesk integration etc.)
@@ -372,24 +494,56 @@ func (p *uploadPackage) submitHostedDropzone(secureLink, email, label string) er
 		return fmt.Errorf("dropzone submission failed: %s", dropzoneResp.Error)
 	}
 
-	// Submit to integration webhooks (e.g., Zendesk)
+	// Submit to integration webhooks (e.g., Zendesk) if label provided.
+	if label == "" {
+		return nil
+	}
+	var webhookErrors []string
 	for _, integrationURL := range dropzoneResp.IntegrationUrls {
 		webhookData := url.Values{}
 		webhookData.Set("digest", dropzoneResp.Digest)
 		webhookData.Set("data", dropzoneResp.Data)
 		webhookData.Set("secureLink", secureLink)
 
-		webhookReq, err := http.NewRequest("POST", integrationURL, bytes.NewBufferString(webhookData.Encode()))
-		if err != nil {
-			continue // skip failed webhooks like JS does
-		}
-		webhookReq.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+		const maxAttempts = 3
+		var lastErr string
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			webhookReq, err := http.NewRequest("POST", integrationURL, bytes.NewBufferString(webhookData.Encode()))
+			if err != nil {
+				lastErr = err.Error()
+				break
+			}
+			webhookReq.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 
-		webhookResp, err := p.client.http.Do(webhookReq)
-		if err != nil {
-			continue
+			webhookResp, err := p.client.http.Do(webhookReq)
+			if err != nil {
+				lastErr = err.Error()
+				continue
+			}
+			body, _ := io.ReadAll(webhookResp.Body)
+			webhookResp.Body.Close()
+
+			var result struct {
+				Result string `json:"result"`
+			}
+			if err := json.Unmarshal(body, &result); err == nil {
+				switch strings.ToUpper(result.Result) {
+				case "SUCCESS":
+					goto nextWebhook
+				case "ERROR":
+					lastErr = fmt.Sprintf("webhook returned ERROR: %s", string(body))
+					goto nextWebhook
+				}
+			}
+			lastErr = fmt.Sprintf("unexpected webhook response: %s", string(body))
 		}
-		webhookResp.Body.Close()
+		if lastErr != "" {
+			webhookErrors = append(webhookErrors, lastErr)
+		}
+	nextWebhook:
+	}
+	if len(webhookErrors) > 0 {
+		return fmt.Errorf("integration webhook errors: %s", strings.Join(webhookErrors, "; "))
 	}
 
 	return nil
