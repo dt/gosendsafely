@@ -82,8 +82,9 @@ func UploadToDropzone(
 		}
 	}
 
-	// Distribute keycodes to package recipients before finalizing.
-	_ = pkg.distributeKeycodes()
+	if err := pkg.distributeKeycodes(); err != nil {
+		return "", fmt.Errorf("distribute keycodes: %w", err)
+	}
 
 	link, err := pkg.finalize(email)
 	if err != nil {
