@@ -85,7 +85,7 @@ func run(cmd *cobra.Command, args []string) error {
 	// List mode
 	if listOnly {
 		for _, f := range files {
-			fmt.Printf("%s\t%s\n", f.Name, util.BytesSize(f.Size))
+			fmt.Printf("%s\t%s\t%s\n", f.Name, util.BytesSize(f.Size), f.UploadedAt)
 		}
 		return nil
 	}

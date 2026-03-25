@@ -21,9 +21,9 @@ import (
 // mockSendSafelyServer creates a test server that simulates the SendSafely API.
 type mockSendSafelyServer struct {
 	*httptest.Server
-	packages      map[string]*mockPackage
-	userEmail     string
-	validAPIKey   string
+	packages       map[string]*mockPackage
+	userEmail      string
+	validAPIKey    string
 	validAPISecret string
 }
 
@@ -36,11 +36,12 @@ type mockPackage struct {
 }
 
 type mockFile struct {
-	fileID   string
-	fileName string
-	fileSize int
-	parts    int
-	chunks   [][]byte // decrypted content for each chunk
+	fileID       string
+	fileName     string
+	fileUploaded string
+	fileSize     int
+	parts        int
+	chunks       [][]byte // decrypted content for each chunk
 }
 
 func newMockSendSafelyServer() *mockSendSafelyServer {
@@ -100,10 +101,11 @@ func (m *mockSendSafelyServer) handlePackage(w http.ResponseWriter, r *http.Requ
 		files := make([]map[string]interface{}, len(pkg.files))
 		for i, f := range pkg.files {
 			files[i] = map[string]interface{}{
-				"fileId":   f.fileID,
-				"fileName": f.fileName,
-				"fileSize": fmt.Sprintf("%d", f.fileSize),
-				"parts":    f.parts,
+				"fileId":       f.fileID,
+				"fileName":     f.fileName,
+				"fileUploaded": f.fileUploaded,
+				"fileSize":     fmt.Sprintf("%d", f.fileSize),
+				"parts":        f.parts,
 			}
 		}
 
@@ -245,8 +247,8 @@ func TestOpenPackage_Success(t *testing.T) {
 		serverSecret: "server-secret-123",
 		keyCode:      "key-code-456",
 		files: []mockFile{
-			{fileID: "file-1", fileName: "document.pdf", fileSize: 1024, parts: 1, chunks: [][]byte{bytes.Repeat([]byte("A"), 1024)}},
-			{fileID: "file-2", fileName: "archive.zip", fileSize: 2048, parts: 2, chunks: [][]byte{bytes.Repeat([]byte("B"), 1024), bytes.Repeat([]byte("C"), 1024)}},
+			{fileID: "file-1", fileName: "document.pdf", fileUploaded: "2026-03-24T10:11:12Z", fileSize: 1024, parts: 1, chunks: [][]byte{bytes.Repeat([]byte("A"), 1024)}},
+			{fileID: "file-2", fileName: "archive.zip", fileUploaded: "2026-03-25T13:14:15Z", fileSize: 2048, parts: 2, chunks: [][]byte{bytes.Repeat([]byte("B"), 1024), bytes.Repeat([]byte("C"), 1024)}},
 		},
 	}
 	server.addPackage(pkg)
@@ -275,12 +277,18 @@ func TestOpenPackage_Success(t *testing.T) {
 	if files[0].Size != 1024 {
 		t.Errorf("Expected first file size 1024, got %d", files[0].Size)
 	}
+	if files[0].UploadedAt != "2026-03-24T10:11:12Z" {
+		t.Errorf("Expected first file uploadedAt %q, got %q", "2026-03-24T10:11:12Z", files[0].UploadedAt)
+	}
 
 	if files[1].Name != "archive.zip" {
 		t.Errorf("Expected second file name 'archive.zip', got '%s'", files[1].Name)
 	}
 	if files[1].Size != 2048 {
 		t.Errorf("Expected second file size 2048, got %d", files[1].Size)
+	}
+	if files[1].UploadedAt != "2026-03-25T13:14:15Z" {
+		t.Errorf("Expected second file uploadedAt %q, got %q", "2026-03-25T13:14:15Z", files[1].UploadedAt)
 	}
 }
 

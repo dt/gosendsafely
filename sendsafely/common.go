@@ -27,8 +27,9 @@ type ID string
 type File = stream.ChunkedFile[ID]
 
 type FileInfo struct {
-	Name string
-	Size util.BytesSize
+	Name       string
+	Size       util.BytesSize
+	UploadedAt string
 }
 
 type client struct {
