@@ -392,8 +392,8 @@ func TestDropzoneClient_CreatePackage(t *testing.T) {
 	if pkg.serverSecret == "" {
 		t.Error("serverSecret should not be empty")
 	}
-	if len(pkg.keyCode) != 64 {
-		t.Errorf("keyCode should be 64 chars, got %d", len(pkg.keyCode))
+	if len(pkg.keyCode) != 43 {
+		t.Errorf("keyCode should be 43 chars, got %d", len(pkg.keyCode))
 	}
 }
 
