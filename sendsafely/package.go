@@ -132,10 +132,11 @@ type Package struct {
 		PackageCode  string `json:"packageCode"`
 		ServerSecret string `json:"serverSecret"`
 		Files        []struct {
-			FileID   string `json:"fileId"`
-			FileName string `json:"fileName"`
-			FileSize string `json:"fileSize"`
-			Parts    int    `json:"parts"`
+			FileID       string `json:"fileId"`
+			FileName     string `json:"fileName"`
+			FileUploaded string `json:"fileUploaded"`
+			FileSize     string `json:"fileSize"`
+			Parts        int    `json:"parts"`
 		} `json:"files"`
 		Response string `json:"response"`
 	}
@@ -148,7 +149,7 @@ func (p *Package) Files() []FileInfo {
 	files := make([]FileInfo, len(p.info.Files))
 	for i, f := range p.info.Files {
 		size, _ := strconv.Atoi(f.FileSize)
-		files[i] = FileInfo{Name: f.FileName, Size: util.BytesSize(size)}
+		files[i] = FileInfo{Name: f.FileName, Size: util.BytesSize(size), UploadedAt: f.FileUploaded}
 	}
 	return files
 }
